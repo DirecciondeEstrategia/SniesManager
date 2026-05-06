@@ -25,8 +25,71 @@ from etl.config import (
     ESTUDIO_MERCADO_DIR,
     NIVELES_MERCADO,
 )
-from etl.pipeline_logger import log_warning
+from etl.pipeline_logger import log_info, log_warning
 from etl.scoring import apply_scoring
+
+_PROG_IDS_PATH = REF_DIR / "backup" / "prog_ids.csv"
+# Rango reservado EAFIT: 900001-900999.
+_PROG_ID_BASE = 900001
+
+
+def _get_or_assign_prog_id(programas: list[str]) -> dict[str, str]:
+    """
+    Lee/genera el registro permanente de IDs de programa EAFIT
+    (ref/backup/prog_ids.csv). Una vez asignado, el ID no cambia.
+    Los programas nuevos reciben el siguiente ID disponible.
+
+    Cuando el MEN asigne un código SNIES real, actualizar prog_ids.csv
+    manualmente reemplazando el EAFIT-9XXXXX por el código oficial.
+    """
+    registro: dict[str, str] = {}
+
+    if _PROG_IDS_PATH.exists():
+        try:
+            df_reg = pd.read_csv(_PROG_IDS_PATH, dtype=str)
+            for _, row in df_reg.iterrows():
+                prog = str(row["PROGRAMA_EAFIT"]).strip().upper()
+                registro[prog] = str(row["PROG_ID"]).strip()
+        except Exception as e:
+            log_warning(f"[PROG_ID] No se pudo leer {_PROG_IDS_PATH.name}: {e}")
+
+    max_num = _PROG_ID_BASE - 1
+    for pid in registro.values():
+        try:
+            max_num = max(max_num, int(pid.replace("EAFIT-", "")))
+        except ValueError:
+            pass
+
+    nuevos: list[str] = []
+    for prog in programas:
+        prog_norm = str(prog).strip().upper()
+        if prog_norm not in registro:
+            nuevos.append(prog_norm)
+
+    for prog_norm in nuevos:
+        max_num += 1
+        registro[prog_norm] = f"EAFIT-{max_num}"
+        log_info(f"[PROG_ID] Nuevo programa registrado: {prog_norm} → EAFIT-{max_num}")
+
+    if nuevos:
+        _PROG_IDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        df_out = pd.DataFrame(
+            [(prog, pid) for prog, pid in sorted(registro.items(), key=lambda x: x[1])],
+            columns=["PROGRAMA_EAFIT", "PROG_ID"],
+        )
+        df_out.to_csv(_PROG_IDS_PATH, index=False, encoding="utf-8-sig")
+        log_info(f"[PROG_ID] Registro actualizado: {len(registro)} programas en {_PROG_IDS_PATH.name}")
+
+    return registro
+
+
+# TASA_CAPTURA_EAFIT — fracción del promedio regional de primer_curso que
+# se estima capturará un programa nuevo de EAFIT en su primer año de operación.
+TASA_CAPTURA_EAFIT: float = 0.35
+
+# ANO_LANZAMIENTO sugerido por el sistema según urgencia de mercado.
+_ANO_LANZAMIENTO_URGENTE = 2026
+_ANO_LANZAMIENTO_NORMAL = 2027
 
 # ── Definición de segmentos regionales (alineado con run_segmentos_regionales / nombres de parquet) ──
 COL_DEPT = "DEPARTAMENTO_OFERTA_PROGRAMA"
@@ -135,7 +198,15 @@ def _leer_programas_eafit(log: Callable) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     log(f"  Programas EAFIT a valorizar: {len(df)}")
-    return df[["CATEGORIA_RAW", "NIVEL", "PROGRAMA_EAFIT", "TIENE_ESTUDIO_MERCADO"]]
+    _id_map = _get_or_assign_prog_id(df["PROGRAMA_EAFIT"].tolist())
+    df["PROG_ID"] = (
+        df["PROGRAMA_EAFIT"]
+        .astype(str).str.strip().str.upper()
+        .map(_id_map)
+        .fillna("EAFIT-??????")
+    )
+    log(f"  PROG_IDs cargados. Rango: {df['PROG_ID'].min()} ... {df['PROG_ID'].max()}")
+    return df[["PROG_ID", "CATEGORIA_RAW", "NIVEL", "PROGRAMA_EAFIT", "TIENE_ESTUDIO_MERCADO"]]
 
 
 def _categorias_de_raw(categoria_raw: str) -> list[str]:
@@ -159,6 +230,8 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
     Usa los nombres EXACTOS de columnas que produce run_fase4_desde_sabana().
     """
     VACIAS = {
+        "CAT_ID": "",
+        "prom_matricula_por_programa_2024": 0.0,
         "prom_matricula_2024": 0.0,
         "participacion_2024": 0.0,
         "AAGR_ROBUSTO": np.nan,
@@ -201,10 +274,16 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
             return default
 
         _pmp = _get("prom_matricula_por_programa_2024")
+        if not pd.notna(_pmp):
+            _pmp = _get("prom_primer_curso_2024")  # fallback explícito si la columna alias no existe
+        _pmp_val = _pmp if pd.notna(_pmp) else _get("prom_matricula_2024", 0.0)
+        _cat_id_cell = row["CAT_ID"] if "CAT_ID" in row.index else ""
+        _cat_id = str(_cat_id_cell).strip() if pd.notna(_cat_id_cell) and str(_cat_id_cell).strip() else ""
         met = {
-            "prom_matricula_2024": (
-                _pmp if pd.notna(_pmp) else _get("prom_matricula_2024", 0.0)
-            ),
+            "CAT_ID": _cat_id,
+            # prom_matricula_por_programa_2024 es el nombre que scoring.py busca PRIMERO (= primer_curso)
+            "prom_matricula_por_programa_2024": _pmp_val,
+            "prom_matricula_2024": _pmp_val,  # mantener para compatibilidad con columnas Excel
             "participacion_2024": _get("participacion_2024", 0.0),
             "AAGR_ROBUSTO": _get("AAGR_ROBUSTO"),
             "salario_promedio_smlmv": _get("salario_promedio_smlmv"),
@@ -226,8 +305,15 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
         return resultados[0]
 
     # Promediar métricas de múltiples categorías (programas multi-categoría)
-    prom: dict[str, float] = {}
+    prom: dict[str, float | str] = {}
     for k in resultados[0]:
+        if k == "CAT_ID":
+            cid = next(
+                (str(m[k]).strip() for m in resultados if m.get(k) and str(m[k]).strip()),
+                "",
+            )
+            prom[k] = cid
+            continue
         vals = [m[k] for m in resultados if pd.notna(m.get(k))]
         prom[k] = float(np.mean(vals)) if vals else np.nan
     return prom
@@ -267,6 +353,7 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
     """
     if len(sub) == 0:
         return {
+            "prom_matricula_por_programa_2024": 0.0,
             "prom_matricula_2024": 0.0,
             "participacion_2024": 0.0,
             "AAGR_ROBUSTO": np.nan,
@@ -275,6 +362,7 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
             "num_programas_2024": 0,
             "distancia_costo_pct": np.nan,
             # Extras para el Excel
+            "suma_primer_curso_2024": 0.0,
             "suma_matricula_2024": 0,
             "programas_activos": 0,
             "programas_nuevos_3a": 0,
@@ -284,13 +372,17 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
         }
 
     # Matrícula
-    prom_mat = float(sub["matricula_2024"].mean()) if "matricula_2024" in sub.columns else 0.0
-    suma_mat = float(sub["matricula_2024"].sum()) if "matricula_2024" in sub.columns else 0.0
+    # Preferir primer_curso_2024 (flujo de nuevos) — mismo criterio que pipeline principal v4.2
+    # Fallback a matricula_2024 si no existe la columna en la sábana
+    _pc_col = "primer_curso_2024" if "primer_curso_2024" in sub.columns else "matricula_2024"
+    prom_mat = float(sub[_pc_col].mean()) if _pc_col in sub.columns else 0.0
+    suma_mat = float(sub[_pc_col].sum()) if _pc_col in sub.columns else 0.0
     num_prog = int((sub["matricula_2024"] > 0).sum()) if "matricula_2024" in sub.columns else 0
 
-    # Participación: prom_mat de esta categoría / suma de prom_mat de TODAS las categorías del df_region
-    if "matricula_2024" in df_region_completo.columns and "CATEGORIA_FINAL" in df_region_completo.columns:
-        todos_proms = df_region_completo.groupby("CATEGORIA_FINAL")["matricula_2024"].mean()
+    # Participación sobre primer_curso (flujo), no sobre stock total — igual que pipeline principal
+    _pc_col_reg = "primer_curso_2024" if "primer_curso_2024" in df_region_completo.columns else "matricula_2024"
+    if _pc_col_reg in df_region_completo.columns and "CATEGORIA_FINAL" in df_region_completo.columns:
+        todos_proms = df_region_completo.groupby("CATEGORIA_FINAL")[_pc_col_reg].mean()
         total_prom_sum = todos_proms.sum()
         participacion = prom_mat / total_prom_sum if total_prom_sum > 0 else 0.0
     else:
@@ -304,11 +396,15 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
 
     # Pct no matriculados 2024
     pct_no_mat = np.nan
-    if "inscritos_2024" in sub.columns and "matricula_2024" in sub.columns:
-        ins = sub["inscritos_2024"].sum()
-        mat = sub["matricula_2024"].sum()
-        if ins > mat > 0:
-            pct_no_mat = (ins - mat) / ins
+    # Fórmula corregida v4.2: (inscritos - primer_curso) / inscritos
+    # NO comparar vs matricula_total (genera negativos porque acumula cohortes previas)
+    _ins_col = next((c for c in ["inscritos_2024_suma", "inscritos_2024"] if c in sub.columns), None)
+    _pc_col_pct = next((c for c in ["primer_curso_2024"] if c in sub.columns), None)
+    if _ins_col and _pc_col_pct:
+        ins = float(sub[_ins_col].sum())
+        pc = float(sub[_pc_col_pct].sum())
+        if ins > 0:
+            pct_no_mat = float(np.clip((ins - pc) / ins, 0.0, 1.0))
         elif "pct_no_matriculados_2024" in sub.columns:
             pct_no_mat = float(sub["pct_no_matriculados_2024"].mean())
     elif "pct_no_matriculados_2024" in sub.columns:
@@ -327,7 +423,8 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
     pct_con_mat = num_prog / prog_activos if prog_activos > 0 else 0.0
 
     return {
-        "prom_matricula_2024": prom_mat,
+        "prom_matricula_por_programa_2024": prom_mat,  # nombre primario para scoring.py
+        "prom_matricula_2024": prom_mat,  # alias para columnas Excel
         "participacion_2024": participacion,
         "AAGR_ROBUSTO": aagr,
         "salario_promedio_smlmv": salario_smlmv,
@@ -335,6 +432,7 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
         "num_programas_2024": num_prog,
         "distancia_costo_pct": dist_costo,
         # Extras para mostrar en el Excel
+        "suma_primer_curso_2024": suma_mat,
         "suma_matricula_2024": suma_mat,
         "programas_activos": prog_activos,
         "programas_nuevos_3a": prog_nuevos,
@@ -346,10 +444,17 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
 
 def _score_y_calificacion(metricas: dict) -> dict:
     """Aplica scoring.py a las métricas y retorna el dict enriquecido con scores y calificacion_final."""
+    # Valor de scoring de matrícula: preferir prom_matricula_por_programa_2024 (= primer_curso)
+    # que scoring.py busca primero. Fallback a prom_matricula_2024 si no está.
+    _pmp_scoring = metricas.get(
+        "prom_matricula_por_programa_2024",
+        metricas.get("prom_matricula_2024", 0),
+    )
     df_tmp = pd.DataFrame(
         [
             {
-                "prom_matricula_2024": metricas.get("prom_matricula_2024", 0),
+                "prom_matricula_por_programa_2024": _pmp_scoring,
+                "prom_matricula_2024": _pmp_scoring,
                 "participacion_2024": metricas.get("participacion_2024", 0),
                 "AAGR_ROBUSTO": metricas.get("AAGR_ROBUSTO", np.nan),
                 "salario_promedio_smlmv": metricas.get("salario_promedio_smlmv", np.nan),
@@ -475,6 +580,22 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
 
     log("  Cargando agregados MERCADO regionales (parquet)...")
     agregados: dict[str, pd.DataFrame] = {}
+
+    # Agregado nacional como fallback de AAGR cuando el regional es NaN.
+    # Es fundamental para Eje Cafetero y Virtual donde muchas categorías
+    # no tienen historia suficiente para calcular AAGR_ROBUSTO regional.
+    ag_colombia: pd.DataFrame | None = None
+    for _nombre_colombia in ["agregado_Colombia.parquet", "agregado_categorias.parquet"]:
+        _path_col = TEMP_DIR / _nombre_colombia
+        if _path_col.exists():
+            try:
+                ag_colombia = pd.read_parquet(_path_col)
+                log(f"  ✓ Fallback AAGR nacional cargado: {_nombre_colombia} ({len(ag_colombia)} cats)")
+            except Exception as _e:
+                log_warning(f"  ⚠ No se pudo cargar {_nombre_colombia}: {_e}")
+            break
+    if ag_colombia is None:
+        log_warning("  ⚠ No se encontró agregado nacional. AAGR faltantes quedarán como NaN.")
     for seg in SEGMENTOS:
         cache = TEMP_DIR / f"agregado_{seg}.parquet"
         if not cache.exists():
@@ -544,15 +665,45 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
             region = LABEL_REGION[seg]
             # MERCADO: agregado regional (parquet Fase 4 por segmento)
             met_m = _lookup_categoria(agregados.get(seg), categorias)
+
+            # Fallback AAGR: si el regional es NaN, usar el nacional (tendencia de largo plazo)
+            if pd.isna(met_m.get("AAGR_ROBUSTO")) and ag_colombia is not None:
+                met_nac_fallback = _lookup_categoria(ag_colombia, categorias)
+                aagr_nac = met_nac_fallback.get("AAGR_ROBUSTO")
+                if pd.notna(aagr_nac):
+                    met_m = {**met_m, "AAGR_ROBUSTO": float(aagr_nac)}
+                    log_info(
+                        f"    AAGR fallback: {categorias[0]!r} en {LABEL_REGION[seg]} "
+                        f"usa AAGR nacional = {float(aagr_nac):.1%}"
+                    )
+
             met_m_s = _score_y_calificacion(met_m)
 
             # REFERENTES: agregado Fase 4 sobre IES referentes NACIONALES (sin filtro regional)
             met_r = _lookup_categoria(ag_ref_nacional, categorias)
             met_r_s = _score_y_calificacion(met_r)
 
+            cal_integrada = (
+                float(
+                    np.sqrt(
+                        met_m_s.get("calificacion_final", 0)
+                        * met_r_s.get("calificacion_final", 0)
+                    )
+                )
+                if (
+                    pd.notna(met_m_s.get("calificacion_final"))
+                    and pd.notna(met_r_s.get("calificacion_final"))
+                    and met_m_s.get("calificacion_final", 0) > 0
+                    and met_r_s.get("calificacion_final", 0) > 0
+                )
+                else np.nan
+            )
+
             filas.append(
                 {
                     # Identificación
+                    "PROG_ID": str(prog_row.get("PROG_ID", "")),
+                    "CAT_ID": str(met_m_s.get("CAT_ID", "") or ""),
                     "CATEGORIA": cat_raw,
                     "NIVEL": nivel,
                     "PROGRAMA_EAFIT": programa,
@@ -601,25 +752,32 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                     # ── CALIFICACIÓN INTEGRADA ────────────────────────────────
                     # Media geométrica de mercado y referentes (√(M × R))
                     # Replica el Índice de Oportunidad de Portafolio del manual
-                    "CAL_INTEGRADA": (
-                        float(
-                            np.sqrt(
-                                met_m_s.get("calificacion_final", 0)
-                                * met_r_s.get("calificacion_final", 0)
-                            )
-                        )
+                    "CAL_INTEGRADA": cal_integrada,
+                    # ── VIABILIDAD_ESTUDIO — derivada de CAL_INTEGRADA ──────
+                    "VIABILIDAD_ESTUDIO": (
+                        "ALTA" if cal_integrada >= 3.5 else
+                        "MEDIA" if cal_integrada >= 3.0 else
+                        "BAJA" if cal_integrada >= 2.5 else
+                        "MUY_BAJA"
+                    ) if pd.notna(cal_integrada) else np.nan,
+                    "PROYECCION_ANUAL": max(
+                        1,
+                        round(
+                            float(met_r_s.get("prom_matricula_2024", 0) or 0)
+                            * TASA_CAPTURA_EAFIT
+                        ),
+                    ) if pd.notna(met_r_s.get("prom_matricula_2024")) else np.nan,
+                    "ANO_LANZAMIENTO": (
+                        _ANO_LANZAMIENTO_URGENTE
                         if (
-                            pd.notna(met_m_s.get("calificacion_final"))
-                            and pd.notna(met_r_s.get("calificacion_final"))
-                            and met_m_s.get("calificacion_final", 0) > 0
-                            and met_r_s.get("calificacion_final", 0) > 0
+                            pd.notna(cal_integrada)
+                            and cal_integrada >= 3.5
+                            and float(met_r_s.get("AAGR_ROBUSTO", 0) or 0) >= 0.05
                         )
+                        else _ANO_LANZAMIENTO_NORMAL
+                        if (pd.notna(cal_integrada) and cal_integrada >= 3.0)
                         else np.nan
                     ),
-                    # ── COLUMNAS MANUALES (se dejan vacías para llenado posterior) ─
-                    "VIABILIDAD_ESTUDIO": np.nan,
-                    "PROYECCION_ANUAL": np.nan,
-                    "ANO_LANZAMIENTO": np.nan,
                     "SEMESTRE_LANZAMIENTO": np.nan,
                 }
             )
@@ -644,6 +802,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     """Formato visual: encabezados de dos niveles, colores por sección, scores con escala de color."""
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
+    from openpyxl.comments import Comment
 
     wb = writer.book
     ws = writer.sheets["Valorizacion"]
@@ -684,7 +843,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     # Insertar 2 filas de encabezado
     ws.insert_rows(1, 2)
 
-    N_ID = 5
+    N_ID = 7  # PROG_ID, CAT_ID, Categoría, Nivel, Programa, ¿Estudio?, Región
     N_MET = 19  # columnas por sección (M_ y R_)
 
     # Fila 1: bloques de sección
@@ -704,12 +863,14 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
 
     # Fila 2: nombres de columnas legibles
     NOMBRES = {
+        "PROG_ID": "ID Programa",
+        "CAT_ID": "ID Categoría",
         "CATEGORIA": "Categoría",
         "NIVEL": "Nivel",
         "PROGRAMA_EAFIT": "Programa EAFIT",
         "TIENE_ESTUDIO_MERCADO": "¿Tiene estudio?",
         "REGION": "Región",
-        "M_prom_matricula": "Prom. Matrícula 2024",
+        "M_prom_matricula": "Prom. Primer Curso 2024",
         "M_score_matricula": "Score",
         "M_participacion": "Participación 2024",
         "M_score_participacion": "Score",
@@ -728,7 +889,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "M_costo_promedio": "Costo Promedio",
         "M_score_costo": "Score",
         "M_calificacion": "CALIFICACIÓN",
-        "R_prom_matricula": "Prom. Matrícula 2024",
+        "R_prom_matricula": "Prom. Primer Curso 2024",
         "R_score_matricula": "Score",
         "R_participacion": "Participación 2024",
         "R_score_participacion": "Score",
@@ -760,6 +921,11 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         cell.font = font(BLANCO, bold=True, size=9)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = borde
+        if col == "VIABILIDAD_ESTUDIO":
+            cell.comment = Comment(
+                "Calculado automáticamente desde CAL_INTEGRADA. Ajustar si hay factores adicionales.",
+                "SNIESManager",
+            )
     ws.row_dimensions[2].height = 32
 
     # Identificar columnas por tipo
@@ -777,6 +943,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         ci
         for ci, c in enumerate(cols, 1)
         if any(k in c for k in ("num_programas", "activos", "nuevos", "inactivos"))
+        or c in ("PROYECCION_ANUAL", "ANO_LANZAMIENTO")
     }
     cost_cols = {ci for ci, c in enumerate(cols, 1) if "costo_promedio" in c}
 
@@ -829,6 +996,8 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
 
     # Anchos
     ANCHOS = {
+        "PROG_ID": 14,
+        "CAT_ID": 12,
         "CATEGORIA": 32,
         "NIVEL": 16,
         "PROGRAMA_EAFIT": 36,
@@ -843,5 +1012,5 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     for ci, col in enumerate(cols, 1):
         ws.column_dimensions[get_column_letter(ci)].width = ANCHOS.get(col, 9 if "score" in col.lower() else 14)
 
-    ws.freeze_panes = "F3"
+    ws.freeze_panes = "H3"
     ws.auto_filter.ref = f"A2:{get_column_letter(len(cols))}{2 + len(df_out)}"

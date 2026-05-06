@@ -57,6 +57,59 @@ from etl.scraper_matriculas import SNIESMatriculasScraper
 from etl.scraper_ole import OLEScraper
 from etl.scoring import apply_scoring
 
+_CAT_IDS_PATH = REF_DIR / "backup" / "cat_ids.csv"
+
+
+def _get_or_assign_cat_id(categorias: list[str]) -> dict[str, str]:
+    """
+    Lee el registro permanente de IDs de categoría (ref/backup/cat_ids.csv).
+    Las categorías existentes conservan su ID original.
+    Las categorías nuevas reciben el siguiente ID disponible y se persisten.
+
+    Formato del CSV: CATEGORIA_FINAL,CAT_ID
+
+    Retorna: dict {CATEGORIA_FINAL_upper → CAT_ID}
+    """
+    registro: dict[str, str] = {}
+
+    if _CAT_IDS_PATH.exists():
+        try:
+            df_reg = pd.read_csv(_CAT_IDS_PATH, dtype=str)
+            for _, row in df_reg.iterrows():
+                cat = str(row["CATEGORIA_FINAL"]).strip().upper()
+                registro[cat] = str(row["CAT_ID"]).strip()
+        except Exception as e:
+            log_warning(f"[CAT_ID] No se pudo leer {_CAT_IDS_PATH.name}: {e}")
+
+    max_num = 0
+    for cid in registro.values():
+        try:
+            max_num = max(max_num, int(cid.replace("CAT-", "")))
+        except ValueError:
+            pass
+
+    nuevas: list[str] = []
+    for cat in categorias:
+        cat_norm = str(cat).strip().upper()
+        if cat_norm not in registro:
+            nuevas.append(cat_norm)
+
+    for cat_norm in nuevas:
+        max_num += 1
+        registro[cat_norm] = f"CAT-{max_num:04d}"
+        log_info(f"[CAT_ID] Nueva categoría registrada: {cat_norm} → CAT-{max_num:04d}")
+
+    if nuevas:
+        _CAT_IDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        df_out = pd.DataFrame(
+            [(cat, cid) for cat, cid in sorted(registro.items(), key=lambda x: x[1])],
+            columns=["CATEGORIA_FINAL", "CAT_ID"],
+        )
+        df_out.to_csv(_CAT_IDS_PATH, index=False, encoding="utf-8-sig")
+        log_info(f"[CAT_ID] Registro actualizado: {len(registro)} categorías en {_CAT_IDS_PATH.name}")
+
+    return registro
+
 
 def _normalizar_codigo_snies(serie: pd.Series) -> pd.Series:
     """Convierte códigos SNIES a string y elimina sufijo '.0'."""
@@ -1770,6 +1823,18 @@ def run_fase4_desde_sabana(df: pd.DataFrame, modo_local: bool = False) -> pd.Dat
     # Bloque E: scoring
     ag = apply_scoring(ag, modo_local=modo_local)
 
+    # CAT_ID — identificador estable de categoría desde registro permanente
+    if "CATEGORIA_FINAL" in ag.columns:
+        _id_map = _get_or_assign_cat_id(ag["CATEGORIA_FINAL"].tolist())
+        ag["CAT_ID"] = (
+            ag["CATEGORIA_FINAL"]
+            .astype(str).str.strip().str.upper()
+            .map(_id_map)
+            .fillna("CAT-????")
+        )
+    else:
+        ag["CAT_ID"] = "CAT-????"
+
     return ag
 
 
@@ -1821,6 +1886,13 @@ def run_fase4() -> pd.DataFrame | None:
 
 # Bloques para hoja "total" (encabezado fila 1)
 _BLOQUES_TOTAL = [
+    # ── 0. CATEGORÍA (ID + metadatos) ─────────────────────────────────────
+    ("CATEGORÍA", [
+        "CAT_ID",
+        "CATEGORIA_FINAL",
+        "FUENTE_CATEGORIA",
+        "NIVEL_MAYORIT",
+    ]),
     # ── 1. MATRÍCULAS: SUMA ANUAL ─────────────────────────────────────────
     ("MATRÍCULA SUMA", [
         "suma_matricula_2019", "suma_matricula_2020", "suma_matricula_2021",
@@ -3915,10 +3987,12 @@ def _escribir_hoja_total(writer: pd.ExcelWriter, ag: pd.DataFrame) -> list[str]:
         "inscritos_2023_prom_por_programa": "Ins. 2023 Prom/Prog",
         "inscritos_2024_prom_por_programa": "Ins. 2024 Prom/Prog",
         "var_inscritos_prom": "Var. Ins. Prom",
+        "CAT_ID": "ID Categoría",
     }
 
     COLORES_BLOQUES = {
         "RESUMEN DECISIÓN": "000066",
+        "CATEGORÍA": "37474F",
         "OFERTA": "2E4057",
         "MATRÍCULAS ANUALES": "546E7A",
         "MATRÍCULAS SEMESTRALES": "78909C",
@@ -3929,11 +4003,8 @@ def _escribir_hoja_total(writer: pd.ExcelWriter, ag: pd.DataFrame) -> list[str]:
     }
     wb = writer.book
     ws = wb.create_sheet("total", 1)
-    col_order = ["CATEGORIA_FINAL"]
+    col_order: list[str] = []
     col_idx = 1
-    ws.cell(row=1, column=1, value="CATEGORIA_FINAL")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=1)
-    col_idx = 2
     for block_name, cols in _BLOQUES_TOTAL:
         present = [c for c in cols if c in ag.columns]
         if not present:
@@ -3961,8 +4032,7 @@ def _escribir_hoja_total(writer: pd.ExcelWriter, ag: pd.DataFrame) -> list[str]:
         cell_h.font = _Ft(bold=True, name="Arial", size=9)
         cell_h.alignment = _Al(horizontal="center", vertical="center", wrap_text=True)
     for r_idx, row in enumerate(ag.itertuples(index=False), start=3):
-        ws.cell(row=r_idx, column=1, value=getattr(row, "CATEGORIA_FINAL", ""))
-        c_idx = 2
+        c_idx = 1
         for _, cols in _BLOQUES_TOTAL:
             for c in cols:
                 if c in ag.columns:
@@ -4043,9 +4113,9 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
         for c in range(1, ws.max_column + 1):
             cell = ws.cell(row=r, column=c)
             cell.fill = fill
-            if c == 1:
-                continue
             col_name = col_order[c - 1] if c - 1 < len(col_order) else None
+            if col_name in ("CAT_ID", "CATEGORIA_FINAL", "FUENTE_CATEGORIA", "NIVEL_MAYORIT"):
+                continue
             if col_name in SCORE_COLS_SET:
                 try:
                     sv = int(float(cell.value)) if cell.value is not None else 0
