@@ -20,13 +20,39 @@ from etl.pipeline_logger import log_info
 _SCORE_MATRICULA_PESO = 0.30
 _SCORE_PARTICIPACION_PESO = 0.15
 
-# score_matricula — percentiles reales de prom_primer_curso_2024 sobre Colombia (288 cats)
-# Ejecución: pipeline post-primer_curso · Universos mezclados ESP+MAE+PRE
-# Distribución resultante: ~58 categorías por score (quintílica perfecta)
-_SCORE_MAT_P20 = 3.9
-_SCORE_MAT_P40 = 8.3
-_SCORE_MAT_P60 = 15.0
-_SCORE_MAT_P80 = 27.6
+# score_matricula — percentiles reales de prom_primer_curso_2024 sobre universo
+# POSGRADO-only (ESP+MAE, 288 categorías Colombia). Recalibrado tras excluir
+# programas UNIVERSITARIO del cómputo por categoría.
+# Distribución resultante: ~57/58/57/58/58 categorías por score (quintílica).
+_SCORE_MAT_P20: float = 3.0
+_SCORE_MAT_P40: float = 5.4
+_SCORE_MAT_P60: float = 8.5
+_SCORE_MAT_P80: float = 13.8
+
+# score_matricula — PREGRADO (prom_primer_curso_2024 por categoría, 144 cats Colombia)
+# Universo: programas UNIVERSITARIO dentro de las 144 categorías que los contienen.
+# Distribución real: P20=22 P40=34 P60=49 P80=83 (~10× mayor que posgrado)
+_SCORE_MAT_PRE_P20: float = 22.0
+_SCORE_MAT_PRE_P40: float = 34.0
+_SCORE_MAT_PRE_P60: float = 49.5
+_SCORE_MAT_PRE_P80: float = 83.0
+
+# score_AAGR — árbol de decisión para POSGRADO ─────────────────────────────────
+# ESP (categorías con NIVEL_MAYORIT ∈ {ESPECIALIZACIÓN, ESP.MED.QUIR, ESP.TEC, ESP.TEC.PRO})
+# Distribución AAGR_ROBUSTO ESP: P20=0.8% P40=5.8% P60=10.3% P80=18.0%
+_AAGR_ESP_THRESHOLDS: list[tuple[float, int]] = [
+    (0.008, 1), (0.058, 2), (0.103, 3), (0.180, 4)
+]
+# MAE: más volátil, 33% con AAGR negativo
+# Distribución: P20=-2.1% P40=3.2% P60=7.4% P80=16.3%
+_AAGR_MAE_THRESHOLDS: list[tuple[float, int]] = [
+    (-0.021, 1), (0.032, 2), (0.074, 3), (0.163, 4)
+]
+# PREGRADO: mercado maduro, distribución centrada en crecimiento bajo
+# Distribución: P20=-1.9% P40=0.8% P60=3.4% P80=8.2%
+_AAGR_PRE_THRESHOLDS: list[tuple[float, int]] = [
+    (-0.019, 1), (0.008, 2), (0.034, 3), (0.082, 4)
+]
 
 # Umbrales: lista de (límite_superior_inclusivo, score). Valores por encima del último → score 5 (o 1 si inverse).
 # Para "inverse" (menor es mejor), se usa score 5 para el rango más bajo.
@@ -61,18 +87,63 @@ SCORING_CONFIG = [
         "col": "num_programas_2024",
         "out": "score_num_programas",
         "peso": 0.05,
-        # Umbrales calibrados sobre el pipeline Colombia (288 categorías, media=37 progs/cat).
-        # Percentiles reales: P20=4 · P40=10 · P60=25 · P80=55
-        # Lógica inversa: menos competencia (menos programas) = mejor oportunidad
-        # score 5 = ≤4 programas (mercado muy concentrado, poca competencia)
-        # score 1 = >55 programas (mercado masivo, alta competencia)
-        "thresholds": [(4, 5), (10, 4), (25, 3), (55, 2)],
+        # Percentiles reales posgrado-only (ESP+MAE, 288 cats):
+        # P20=4 · P40=10 · P60=18 · P80=32 (media=21 progs/cat)
+        # P60 actualizado de 25→18, P80 actualizado de 55→32
+        "thresholds": [(4, 5), (10, 4), (18, 3), (32, 2)],
         "inverse": True,
     },
     {
         "col": "distancia_costo_pct",
         "out": "score_costo",
         "peso": 0.05,
+        "thresholds": [(-60, 1), (-40, 2), (-15, 3), (20, 4)],
+        "inverse": False,
+    },
+]
+
+
+# ── Configuración de scoring para universo PREGRADO ──────────────────────────
+# Todos los thresholds calibrados sobre 144 categorías con programas UNIVERSITARIO.
+# Pesos idénticos al posgrado para mantener comparabilidad de estructura.
+SCORING_CONFIG_PREGRADO: list[dict] = [
+    {
+        "col": "AAGR_ROBUSTO",
+        "out": "score_AAGR",
+        "peso": 0.20,
+        # Mercado maduro: P20=-1.9% P40=0.8% P60=3.4% P80=8.2%
+        "thresholds": _AAGR_PRE_THRESHOLDS,
+        "inverse": False,
+    },
+    {
+        "col": "salario_promedio_smlmv",
+        "out": "score_salario",
+        "peso": 0.15,
+        # P20=2.76 P40=3.30 P60=3.90 P80=5.28 SMLMV (escala entrada laboral)
+        "thresholds": [(2.0, 1), (2.76, 2), (3.30, 3), (3.90, 4)],
+        "inverse": False,
+    },
+    {
+        "col": "pct_no_matriculados_2024",
+        "out": "score_pct_no_matriculados",
+        "peso": 0.10,
+        # P20=0.27 P40=0.34 P60=0.41 P80=0.48 (similar a posgrado, escala relativa)
+        "thresholds": [(0.27, 5), (0.34, 4), (0.41, 3), (0.48, 2)],
+        "inverse": True,
+    },
+    {
+        "col": "num_programas_2024",
+        "out": "score_num_programas",
+        "peso": 0.05,
+        # P20=2 P40=7 P60=25 P80=57 (distribución más polarizada que posgrado)
+        "thresholds": [(2, 5), (7, 4), (25, 3), (57, 2)],
+        "inverse": True,
+    },
+    {
+        "col": "distancia_costo_pct",
+        "out": "score_costo",
+        "peso": 0.05,
+        # Mismo threshold: distancia relativa ya ajusta por nivel via BENCHMARK_COSTO_PREGRADO
         "thresholds": [(-60, 1), (-40, 2), (-15, 3), (20, 4)],
         "inverse": False,
     },
@@ -98,7 +169,11 @@ def _value_to_score(value: float, thresholds: list[tuple[float, int]], inverse: 
     return 5.0
 
 
-def apply_scoring(df: pd.DataFrame, modo_local: bool = False) -> pd.DataFrame:
+def apply_scoring(
+    df: pd.DataFrame,
+    modo_local: bool = False,
+    universo: str = "posgrado",
+) -> pd.DataFrame:
     """
     Aplica la calificación ponderada a un DataFrame con las columnas esperadas por SCORING_CONFIG.
     Añade columnas score_* y calificacion_final. NaN en alguna variable no rompe; se usa score 1.
@@ -110,11 +185,22 @@ def apply_scoring(df: pd.DataFrame, modo_local: bool = False) -> pd.DataFrame:
                     DataFrame (para segmentos regionales/modales). Si False (default),
                     usa los thresholds nacionales fijos _SCORE_MAT_P20.._P80,
                     garantizando comparabilidad cross-segmento a nivel Colombia.
+        universo:   "posgrado" (default) usa SCORING_CONFIG y thresholds de matrícula
+                    posgrado. "pregrado" usa SCORING_CONFIG_PREGRADO y thresholds de
+                    matrícula pregrado (~10× mayor). En posgrado, score_AAGR aplica
+                    árbol de decisión por NIVEL_MAYORIT (ESP vs MAE).
     """
     out = df.copy()
-    total_peso = _SCORE_MATRICULA_PESO + _SCORE_PARTICIPACION_PESO + sum(c["peso"] for c in SCORING_CONFIG)
+    scoring_config = SCORING_CONFIG_PREGRADO if universo == "pregrado" else SCORING_CONFIG
+    total_peso = (
+        _SCORE_MATRICULA_PESO
+        + _SCORE_PARTICIPACION_PESO
+        + sum(c["peso"] for c in scoring_config)
+    )
     if abs(total_peso - 1.0) > 1e-9:
-        raise ValueError(f"Los pesos deben sumar 1.0, suman {total_peso}")
+        raise ValueError(
+            f"Los pesos deben sumar 1.0, suman {total_peso} (universo={universo})"
+        )
 
     # ── DIAGNÓSTICO DE DISTRIBUCIÓN ───────────────────────────────────────────
     _cols_diag = {
@@ -170,8 +256,26 @@ def apply_scoring(df: pd.DataFrame, modo_local: bool = False) -> pd.DataFrame:
                 f"P20={_lp20:.2f} P40={_lp40:.2f} P60={_lp60:.2f} P80={_lp80:.2f}"
             )
         else:
-            # Thresholds nacionales fijos calibrados sobre Colombia
-            _bins = [-np.inf, _SCORE_MAT_P20, _SCORE_MAT_P40, _SCORE_MAT_P60, _SCORE_MAT_P80, np.inf]
+            # Thresholds nacionales fijos calibrados sobre Colombia, separados por universo
+            if universo == "pregrado":
+                _p20, _p40, _p60, _p80 = (
+                    _SCORE_MAT_PRE_P20,
+                    _SCORE_MAT_PRE_P40,
+                    _SCORE_MAT_PRE_P60,
+                    _SCORE_MAT_PRE_P80,
+                )
+                log_info(
+                    f"[Scoring] score_matricula PREGRADO → "
+                    f"P20={_p20} P40={_p40} P60={_p60} P80={_p80}"
+                )
+            else:
+                _p20, _p40, _p60, _p80 = (
+                    _SCORE_MAT_P20,
+                    _SCORE_MAT_P40,
+                    _SCORE_MAT_P60,
+                    _SCORE_MAT_P80,
+                )
+            _bins = [-np.inf, _p20, _p40, _p60, _p80, np.inf]
 
         _cat_mat = pd.cut(
             _s_mat,
@@ -213,28 +317,51 @@ def apply_scoring(df: pd.DataFrame, modo_local: bool = False) -> pd.DataFrame:
     else:
         out["score_participacion"] = 1
 
-    for cfg in SCORING_CONFIG:
+    for cfg in scoring_config:
         col = cfg["col"]
         out_col = cfg["out"]
         thresholds = cfg["thresholds"]
         inverse = cfg.get("inverse", False)
+
         if col not in out.columns:
             out[out_col] = 1.0
             continue
-        out[out_col] = out[col].apply(
-            lambda v: _value_to_score(float(v) if pd.notna(v) else np.nan, thresholds, inverse)
-        )
+
+        # Árbol de decisión AAGR: thresholds distintos para ESP vs MAE (solo posgrado).
+        # Pregrado cae al else estándar usando _AAGR_PRE_THRESHOLDS dentro de SCORING_CONFIG_PREGRADO.
+        if (
+            col == "AAGR_ROBUSTO"
+            and universo == "posgrado"
+            and "NIVEL_MAYORIT" in out.columns
+        ):
+            def _score_aagr_nivel(
+                row,
+                _esp=_AAGR_ESP_THRESHOLDS,
+                _mae=_AAGR_MAE_THRESHOLDS,
+            ):
+                nivel = str(row.get("NIVEL_MAYORIT", "")).upper()
+                val = row.get("AAGR_ROBUSTO", np.nan)
+                # MAE o ESP (todos los sub-tipos: ESPECIALIZACIÓN, ESP.MED.QUIR, ESP.TEC, ESP.TEC.PRO)
+                thrs = _mae if "MAEST" in nivel else _esp
+                v = float(val) if pd.notna(val) else np.nan
+                return _value_to_score(v, thrs, inverse=False)
+
+            out[out_col] = out.apply(_score_aagr_nivel, axis=1)
+        else:
+            out[out_col] = out[col].apply(
+                lambda v: _value_to_score(float(v) if pd.notna(v) else np.nan, thresholds, inverse)
+            )
 
     out["calificacion_final"] = 0.0
     out["calificacion_final"] += out["score_matricula"].astype(float) * _SCORE_MATRICULA_PESO
     out["calificacion_final"] += out["score_participacion"].astype(float) * _SCORE_PARTICIPACION_PESO
-    for cfg in SCORING_CONFIG:
+    for cfg in scoring_config:
         out["calificacion_final"] += out[cfg["out"]] * cfg["peso"]
     out["calificacion_final"] = out["calificacion_final"].clip(1.0, 5.0).round(4)
 
     for _sc in ["score_matricula", "score_participacion", "score_AAGR", "score_salario"]:
         if _sc in out.columns:
             _dist = out[_sc].value_counts().sort_index().to_dict()
-            log_info(f"[Scoring val] {_sc}: {_dist}")
+            log_info(f"[Scoring val/{universo}] {_sc}: {_dist}")
 
     return out

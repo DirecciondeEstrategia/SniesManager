@@ -5502,7 +5502,8 @@ class MercadoPipelinePage(ttk.Frame):
                 return
             self.root.after(0, lambda: self._log_message("Ejecutando Fase 4 (agregación + scoring)..."))
             self.root.after(0, lambda: self._update_progress(3, "Fase 4..."))
-            ag = run_fase4()
+            ag_pos, ag_pre = run_fase4()
+            ag = ag_pos  # alias backward-compat para downstream que asume hoja `total`
             self.root.after(0, lambda: self._update_progress(3, "Fase 4 ✓"))
 
             # Fase 5
@@ -5511,7 +5512,7 @@ class MercadoPipelinePage(ttk.Frame):
                 return
             self.root.after(0, lambda: self._log_message("Ejecutando Fase 5 (exportación)..."))
             self.root.after(0, lambda: self._update_progress(4, "Fase 5..."))
-            run_fase5(ag)
+            run_fase5(ag_pos, ag_pre)
             self.root.after(0, lambda: self._update_progress(4, "Fase 5 ✓"))
 
             if self.cancel_event.is_set():
@@ -5624,7 +5625,7 @@ class MercadoPipelinePage(ttk.Frame):
         self._refresh_checkpoint_label()
         from etl.config import ESTUDIO_MERCADO_DIR
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        ruta = ESTUDIO_MERCADO_DIR / f"Base_Maestra_F1_{ts}.xlsx"
+        ruta = ESTUDIO_MERCADO_DIR / f"Base_Programas_Categoria_F1_{ts}.xlsx"
         self._log_message(f"Exportando Excel → {ruta} ...")
 
         def _export_worker():

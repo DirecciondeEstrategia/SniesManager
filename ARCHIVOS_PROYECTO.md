@@ -65,7 +65,7 @@ Si falta algún archivo por año, el mercado suele registrar *warning* y continu
 |-------------------|-----------|--------|
 | Excel nacional | `outputs/estudio_de_mercado/Estudio_Mercado_Colombia.xlsx` | Fase 5; puede incluir hoja `cambios_vs_anterior` |
 | Excels segmentados | `outputs/estudio_de_mercado/Estudio_Mercado_Bogota.xlsx`, `..._Antioquia.xlsx`, `..._Eje_Cafetero.xlsx`, `..._Virtual.xlsx` | Reportes regionales / modal |
-| Base maestra F1 (export GUI) | `outputs/estudio_de_mercado/Base_Maestra_F1_*.xlsx` | Desde GUI; datos en parquet de trabajo |
+| Base programas-categoría F1 (export GUI) | `outputs/estudio_de_mercado/Base_Programas_Categoria_F1_*.xlsx` | Desde GUI; datos en parquet de trabajo |
 | Histórico estudio | `outputs/estudio_de_mercado/historico_estudio_de_mercado/` | Respaldos según uso |
 | CSV intermedios Fase 2 | `outputs/historico/raw/` | `matriculados_*`, `inscritos_*`, `primer_curso_*`, `graduados_*`, OLE; pueden borrarse al cerrar Fase 3 |
 

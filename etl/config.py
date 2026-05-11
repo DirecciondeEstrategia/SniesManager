@@ -266,6 +266,27 @@ NIVELES_MERCADO: list[str] = [
     "UNIVERSITARIO",
 ]
 
+# ── Universos separados para scoring diferenciado (Fase 4 / Fase 5) ──────────
+# Filtran PROGRAMAS (no categorías). Al filtrar por NIVELES_POSGRADO dentro de
+# run_fase4_desde_sabana, el groupby por CATEGORIA_FINAL produce 288 categorías
+# (todas tienen al menos un programa ESP/MAE). Por NIVELES_PREGRADO produce 144.
+NIVELES_POSGRADO: frozenset[str] = frozenset({
+    "ESPECIALIZACIÓN",
+    "MAESTRÍA",
+    "ESPECIALIZACIÓN MÉDICO QUIRÚRGICA",
+    "ESPECIALIZACIÓN TECNOLÓGICA",
+    "ESPECIALIZACIÓN TÉCNICO PROFESIONAL",
+})
+NIVELES_PREGRADO: frozenset[str] = frozenset({"UNIVERSITARIO"})
+
+# Sanity check: la unión debe coincidir con NIVELES_MERCADO.
+assert (
+    NIVELES_POSGRADO | NIVELES_PREGRADO
+) == frozenset(NIVELES_MERCADO), (
+    "NIVELES_POSGRADO ∪ NIVELES_PREGRADO debe igualar NIVELES_MERCADO. "
+    "Si añades un nivel en NIVELES_MERCADO, asígnalo también a uno de los dos universos."
+)
+
 # ── Análisis regional ────────────────────────────────────────────────────────
 UMBRAL_REGIONAL_MATRICULA: int = 50
 

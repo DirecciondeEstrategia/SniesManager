@@ -37,6 +37,8 @@ from etl.config import (
     MODELO_CLASIFICADOR_MERCADO,
     MODELS_DIR,
     NIVELES_MERCADO,
+    NIVELES_POSGRADO,
+    NIVELES_PREGRADO,
     RAW_HISTORIC_DIR,
     REF_DIR,
     UMBRAL_REGIONAL_MATRICULA,
@@ -58,6 +60,31 @@ from etl.scraper_ole import OLEScraper
 from etl.scoring import apply_scoring
 
 _CAT_IDS_PATH = REF_DIR / "backup" / "cat_ids.csv"
+_SCORING_PY_PATH = Path(__file__).resolve().parent / "scoring.py"
+
+
+def _cache_invalida(parquet_path: Path) -> bool:
+    """
+    Invalida un parquet de caché si etl/scoring.py es más reciente que él.
+    Retorna True si el archivo se eliminó (o no existía), False si sigue válido.
+
+    Se usa para garantizar que cualquier recalibración del scoring (o cambio de
+    SCORING_CONFIG / thresholds) se propague forzando recalculación, en lugar de
+    leer caché stale.
+    """
+    if not parquet_path.exists():
+        return True
+    try:
+        if (
+            _SCORING_PY_PATH.exists()
+            and _SCORING_PY_PATH.stat().st_mtime > parquet_path.stat().st_mtime
+        ):
+            parquet_path.unlink()
+            log_info(f"[Cache] Invalidado {parquet_path.name} (scoring.py más reciente)")
+            return True
+    except OSError as e:
+        log_warning(f"[Cache] No se pudo invalidar {parquet_path.name}: {e}")
+    return False
 
 
 def _get_or_assign_cat_id(categorias: list[str]) -> dict[str, str]:
@@ -119,6 +146,95 @@ def _normalizar_codigo_snies(serie: pd.Series) -> pd.Series:
         .str.upper()
         .str.replace(r"\.0$", "", regex=True)
     )
+
+
+def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
+    """
+    Lee primer_curso_{year}.xlsx desde ref/backup/ y retorna una Series
+    {snies_norm -> total_anual (S1+S2)} indexada por código SNIES normalizado
+    (misma lógica que _normalizar_codigo_snies).
+    Retorna Series vacía si el archivo no existe o hay error.
+    """
+    candidatos = [
+        ref_dir / "backup" / f"primer_curso_{year}.xlsx",
+        ref_dir / "backup" / "matriculas primer curso" / f"primer_curso_{year}.xlsx",
+        ref_dir / "backup" / "primer_curso" / f"primer_curso_{year}.xlsx",
+        ref_dir / f"primer_curso_{year}.xlsx",
+    ]
+    ruta = next((p for p in candidatos if p.exists()), None)
+    if ruta is None:
+        log_warning(
+            f"[Fase 1] primer_curso_{year}.xlsx no encontrado en ref/backup/. "
+            "Columna quedará vacía."
+        )
+        return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
+
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        try:
+            hoja = next(
+                (
+                    s
+                    for s in wb.sheetnames
+                    if "INDICE" not in str(s).upper() and "ÍNDICE" not in str(s).upper()
+                ),
+                wb.sheetnames[-1],
+            )
+        finally:
+            wb.close()
+
+        df_pc = pd.read_excel(ruta, sheet_name=hoja, header=5, dtype=str, engine="openpyxl")
+        df_pc.columns = [str(c).strip() for c in df_pc.columns]
+
+        # Nombres confirmados en SNIES + fallback por substring (acentos / variantes)
+        col_snies = next(
+            (c for c in df_pc.columns if c == "CÓDIGO SNIES DEL PROGRAMA"),
+            None,
+        ) or next(
+            (c for c in df_pc.columns if "SNIES" in c.upper() and "PROGRAMA" in c.upper()),
+            None,
+        )
+        col_pc = next(
+            (c for c in df_pc.columns if c == "MATRICULADOS PRIMER CURSO"),
+            None,
+        ) or next(
+            (c for c in df_pc.columns if "PRIMER" in c.upper() and "CURSO" in c.upper()),
+            None,
+        )
+        col_sem = next((c for c in df_pc.columns if str(c).strip().upper() == "SEMESTRE"), None)
+
+        if not col_snies or not col_pc:
+            log_warning(
+                f"[Fase 1] primer_curso_{year}: columnas no detectadas "
+                f"(buscadas: 'CÓDIGO SNIES DEL PROGRAMA', 'MATRICULADOS PRIMER CURSO'). "
+                f"Columna quedará vacía."
+            )
+            return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
+
+        use_cols = [col_snies, col_pc] + ([col_sem] if col_sem else [])
+        df_pc = df_pc[use_cols].copy()
+        df_pc.columns = ["SNIES", "PC"] + (["SEM"] if col_sem else [])
+        if col_sem:
+            df_pc = df_pc[df_pc["SEM"].astype(str).str.strip().isin(("1", "2"))].copy()
+
+        df_pc["SNIES"] = _normalizar_codigo_snies(df_pc["SNIES"])
+        df_pc["PC"] = pd.to_numeric(df_pc["PC"], errors="coerce").fillna(0)
+        df_pc = df_pc[df_pc["SNIES"].str.match(r"^\d+$", na=False)]
+
+        serie = df_pc.groupby("SNIES", sort=False)["PC"].sum()
+        serie.name = f"PRIMER_CURSO_{year}"
+
+        log_info(
+            f"[Fase 1] primer_curso_{year}: {len(serie):,} programas, "
+            f"{float(serie.sum()):,.0f} matriculados totales (S1+S2)."
+        )
+        return serie
+
+    except Exception as exc:
+        log_warning(f"[Fase 1] Error leyendo primer_curso_{year}: {exc}. Columna quedará vacía.")
+        return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
 
 
 def _build_texto_ml(df: pd.DataFrame) -> pd.Series:
@@ -265,7 +381,8 @@ def run_fase1() -> pd.DataFrame:
 
     Returns:
         DataFrame con todas las columnas de Programas + CATEGORIA_FINAL +
-        FUENTE_CATEGORIA + TASA_COTIZANTES + SALARIO_OLE + INSCRITOS_2023 + INSCRITOS_2024.
+        FUENTE_CATEGORIA + TASA_COTIZANTES + SALARIO_OLE + INSCRITOS_2023 + INSCRITOS_2024
+        + PRIMER_CURSO_2023 + PRIMER_CURSO_2024 (desde ref/backup/primer_curso_*.xlsx).
     """
     log_etapa_iniciada("Fase 1: Base maestra con categorías (ML)")
 
@@ -602,6 +719,27 @@ def run_fase1() -> pd.DataFrame:
     if mask_cruce_snies.any():
         df_base.loc[mask_cruce_snies, "PROBABILIDAD"] = 1.0
         df_base.loc[mask_cruce_snies, "REQUIERE_REVISION"] = False
+
+    # ── Primer curso 2023 y 2024 ──────────────────────────────────────────────
+    # Fuente: ref/backup/primer_curso_{year}.xlsx (hoja de datos, header=5).
+    # Agrega S1+S2 por CÓDIGO_SNIES_DEL_PROGRAMA.
+    # Idempotente: borra la columna si ya existe antes de re-añadirla.
+    _SNIES_COL = "CÓDIGO_SNIES_DEL_PROGRAMA"
+    _snies_norm_base = _normalizar_codigo_snies(df_base[_SNIES_COL])
+    for _pc_year in (2023, 2024):
+        _col_out = f"PRIMER_CURSO_{_pc_year}"
+        if _col_out in df_base.columns:
+            df_base.drop(columns=[_col_out], inplace=True)
+        _serie_pc = _leer_primer_curso_anual(_pc_year, REF_DIR)
+        df_base[_col_out] = _snies_norm_base.map(_serie_pc)
+        _n_con_dato = int(df_base[_col_out].notna().sum())
+        _n_base = len(df_base)
+        _pct = (_n_con_dato / _n_base * 100) if _n_base else 0.0
+        log_info(
+            f"[Fase 1] {_col_out}: {_n_con_dato:,} / {_n_base:,} programas "
+            f"con dato ({_pct:.1f}% cobertura)."
+        )
+    # ── Fin primer curso ──────────────────────────────────────────────────────
 
     # Reservar 'MANUAL' para correcciones futuras (no se asigna aquí)
     df_base = df_base.drop(
@@ -1374,9 +1512,21 @@ def run_fase3() -> None:
     log_etapa_completada("Fase 3: Consolidación en sábana única", f"{n} filas")
 
 
-def run_fase4_desde_sabana(df: pd.DataFrame, modo_local: bool = False) -> pd.DataFrame:
+def run_fase4_desde_sabana(
+    df: pd.DataFrame,
+    modo_local: bool = False,
+    niveles: frozenset[str] | None = None,
+    universo: str = "posgrado",
+) -> pd.DataFrame:
     """
     Ejecuta la lógica de agregación y scoring de la Fase 4 a partir de un DataFrame de sábana ya cargado.
+
+    Args:
+        df: DataFrame sábana consolidada.
+        modo_local: True → score_matricula con quintiles dinámicos (segmentos regionales).
+        niveles:    subconjunto de NIVELES_MERCADO a incluir. Si None → NIVELES_POSGRADO.
+        universo:   "posgrado" o "pregrado" — pasado a apply_scoring para seleccionar
+                    SCORING_CONFIG y thresholds de matrícula.
 
     No lee ni escribe archivos; retorna únicamente el DataFrame agregado por CATEGORIA_FINAL.
     """
@@ -1390,20 +1540,30 @@ def run_fase4_desde_sabana(df: pd.DataFrame, modo_local: bool = False) -> pd.Dat
             "Elimine el archivo 'outputs/temp/sabana_consolidada.parquet' y vuelva a ejecutar la Fase 3 para limpiar los datos."
         )
 
-    # ── Filtro de niveles de formación ────────────────────────────────────────
+    # ── Filtro de programas por nivel de formación ────────────────────────────
+    # Filtra PROGRAMAS, no categorías. El groupby posterior produce tantas categorías
+    # como categorías únicas tengan programas del nivel solicitado.
+    # - NIVELES_POSGRADO → 288 categorías (todas las del referente tienen ≥1 ESP/MAE)
+    # - NIVELES_PREGRADO → 144 categorías (las que tienen ≥1 UNIVERSITARIO)
     col_nivel = "NIVEL_DE_FORMACIÓN"
-    if col_nivel in df.columns and NIVELES_MERCADO:
+    _niveles_activos = niveles if niveles is not None else NIVELES_POSGRADO
+    if col_nivel in df.columns and _niveles_activos:
         n_antes = len(df)
-        df = df[df[col_nivel].isin(NIVELES_MERCADO)].copy()
+        df = df[df[col_nivel].isin(_niveles_activos)].copy()
         n_despues = len(df)
         log_info(
-            f"[Fase 4] Filtro de niveles: {n_antes:,} → {n_despues:,} programas "
-            f"({n_antes - n_despues:,} excluidos). Niveles activos: {NIVELES_MERCADO}"
+            f"[Fase 4 / {universo}] Filtro de programas: {n_antes:,} → {n_despues:,} "
+            f"({n_antes - n_despues:,} programas de otros niveles excluidos)."
         )
         if n_despues == 0:
-            raise ValueError("El filtro NIVELES_MERCADO excluyó todos los programas.")
+            raise ValueError(
+                f"El filtro de niveles excluyó todos los programas. "
+                f"universo='{universo}', niveles={_niveles_activos}"
+            )
     else:
-        log_info("[Fase 4] NIVEL_DE_FORMACIÓN no encontrada — procesando todos los niveles.")
+        log_info(
+            f"[Fase 4 / {universo}] Columna NIVEL_DE_FORMACIÓN no encontrada — procesando todos."
+        )
 
     years = list(range(2019, 2025))
     grouped = df.groupby("CATEGORIA_FINAL", as_index=True)
@@ -1821,7 +1981,7 @@ def run_fase4_desde_sabana(df: pd.DataFrame, modo_local: bool = False) -> pd.Dat
     ag = ag.replace([np.inf, -np.inf], np.nan)
 
     # Bloque E: scoring
-    ag = apply_scoring(ag, modo_local=modo_local)
+    ag = apply_scoring(ag, modo_local=modo_local, universo=universo)
 
     # CAT_ID — identificador estable de categoría desde registro permanente
     if "CATEGORIA_FINAL" in ag.columns:
@@ -1838,19 +1998,22 @@ def run_fase4_desde_sabana(df: pd.DataFrame, modo_local: bool = False) -> pd.Dat
     return ag
 
 
-def run_fase4() -> pd.DataFrame | None:
+def run_fase4() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """
     Fase 4: Agregación por CATEGORIA_FINAL y scoring ponderado.
-    Agrupa por categoría, genera bloques A–D y aplica apply_scoring (bloque E).
-    Retorna el DataFrame agregado para uso en Fase 5.
+    Retorna (ag_posgrado, ag_pregrado).
+
+    ag_posgrado → hoja 'total'           (288 categorías, solo programas ESP+MAE)
+    ag_pregrado → hoja 'total_pregrado'  (144 categorías, solo programas UNIVERSITARIO)
     """
     log_etapa_iniciada("Fase 4: Agregación por categoría")
     out_path = CHECKPOINT_BASE_MAESTRA.parent / "agregado_categorias.parquet"
+    out_path_pre = CHECKPOINT_BASE_MAESTRA.parent / "agregado_categorias_pregrado.parquet"
     sabana_path = CHECKPOINT_BASE_MAESTRA.parent / "sabana_consolidada.parquet"
 
     if not sabana_path.exists():
         log_error("No existe sábana consolidada. Ejecutar Fase 3 antes.")
-        return None
+        return None, None
     df = pd.read_parquet(sabana_path)
     SCHEMA_VERSION = "v3"
     if "schema_version" in df.columns:
@@ -1867,21 +2030,58 @@ def run_fase4() -> pd.DataFrame | None:
         )
     if "CATEGORIA_FINAL" not in df.columns:
         log_error("Sábana sin columna CATEGORIA_FINAL.")
-        return None
+        return None, None
 
     smlmv_actual = get_smlmv_sesion()
     log_info(f"SMLMV usado en scoring: ${smlmv_actual:,.0f}")
 
-    ag = run_fase4_desde_sabana(df)
-    if ag is None:
-        log_error("Fase 4: la agregación no produjo datos.")
-        return None
+    # ── Invalidar cachés si scoring.py es más reciente ────────────────────────
+    _cache_invalida(out_path)
+    _cache_invalida(out_path_pre)
+
+    # ── Universo posgrado (ESP + MAE, 288 categorías) ─────────────────────────
+    ag_pos = run_fase4_desde_sabana(
+        df, modo_local=False, niveles=NIVELES_POSGRADO, universo="posgrado"
+    )
+    if ag_pos is None:
+        log_error("Fase 4: la agregación de posgrado no produjo datos.")
+        return None, None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ag.to_parquet(out_path, index=False)
-    log_info(f"Agregado por categoría guardado: {out_path} ({len(ag)} filas)")
-    log_etapa_completada("Fase 4: Agregación por categoría", f"{len(ag)} categorías")
-    return ag
+    ag_pos.to_parquet(out_path, index=False)
+    log_info(
+        f"[Fase 4] Agregado posgrado guardado: {out_path.name} "
+        f"({len(ag_pos)} categorías, solo ESP+MAE)"
+    )
+
+    # ── Universo pregrado (UNIVERSITARIO, 144 categorías) ─────────────────────
+    ag_pre: pd.DataFrame | None = None
+    try:
+        ag_pre = run_fase4_desde_sabana(
+            df, modo_local=False, niveles=NIVELES_PREGRADO, universo="pregrado"
+        )
+        if ag_pre is not None:
+            ag_pre.to_parquet(out_path_pre, index=False)
+            log_info(
+                f"[Fase 4] Agregado pregrado guardado: {out_path_pre.name} "
+                f"({len(ag_pre)} categorías, solo UNIVERSITARIO)"
+            )
+        else:
+            log_warning(
+                "[Fase 4] Pregrado: agregación vacía — hoja total_pregrado no se generará."
+            )
+    except Exception as _e:
+        log_warning(
+            f"[Fase 4] Pregrado: error en agregación ({_e}) — hoja total_pregrado omitida."
+        )
+        ag_pre = None
+
+    log_etapa_completada(
+        "Fase 4: Agregación por categoría",
+        f"{len(ag_pos)} cats posgrado | "
+        f"{len(ag_pre) if ag_pre is not None else 0} cats pregrado",
+    )
+    return ag_pos, ag_pre
 
 
 # Bloques para hoja "total" (encabezado fila 1)
@@ -2407,8 +2607,9 @@ def run_analisis_regional(
         return None
 
     col_nivel = "NIVEL_DE_FORMACIÓN"
-    if col_nivel in sabana.columns and NIVELES_MERCADO:
-        sabana = sabana[sabana[col_nivel].isin(NIVELES_MERCADO)].copy()
+    # Hojas regionales solo para posgrado (los segmentos no exportan total_pregrado).
+    if col_nivel in sabana.columns and NIVELES_POSGRADO:
+        sabana = sabana[sabana[col_nivel].isin(NIVELES_POSGRADO)].copy()
 
     years = list(range(2019, 2025))
     registros: list[dict] = []
@@ -2582,12 +2783,13 @@ def _exportar_estudio_segmento(
             _sem_rojo_seg = int((_sf_col_seg < 3.0).sum())
 
             with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
-                # Filtrar por niveles de mercado ANTES de calcular KPIs del resumen,
-                # para que matrículas y certeza sean consistentes con programas_detalle.
+                # Filtrar por niveles de POSGRADO antes de calcular KPIs del resumen,
+                # para que matrículas y certeza sean consistentes con programas_detalle
+                # del segmento (los Excels regionales solo cubren ESP+MAE).
                 col_nivel = "NIVEL_DE_FORMACIÓN"
                 sabana_export = sabana_seg.copy()
-                if col_nivel in sabana_export.columns and NIVELES_MERCADO:
-                    sabana_export = sabana_export[sabana_export[col_nivel].isin(NIVELES_MERCADO)]
+                if col_nivel in sabana_export.columns and NIVELES_POSGRADO:
+                    sabana_export = sabana_export[sabana_export[col_nivel].isin(NIVELES_POSGRADO)]
 
                 try:
                     _escribir_resumen_ejecutivo(
@@ -2752,19 +2954,8 @@ def run_segmentos_regionales(
 
     log_etapa_iniciada("Segmentos regionales/modales")
 
-    _scoring_path = Path(__file__).resolve().parent / "scoring.py"
     for _seg_name in ["Antioquia", "Bogota", "Eje_Cafetero", "Virtual"]:
-        _cache = TEMP_DIR / f"agregado_{_seg_name}.parquet"
-        if (
-            _cache.exists()
-            and _scoring_path.exists()
-            and _scoring_path.stat().st_mtime > _cache.stat().st_mtime
-        ):
-            try:
-                _cache.unlink()
-                log_info(f"[Cache] Invalidado {_cache.name} (scoring.py más reciente)")
-            except OSError as e:
-                log_warning(f"[Cache] No se pudo invalidar {_cache.name}: {e}")
+        _cache_invalida(TEMP_DIR / f"agregado_{_seg_name}.parquet")
 
     for seg in SEGMENTOS:
         if cancel_event is not None and cancel_event.is_set():
@@ -2807,7 +2998,12 @@ def run_segmentos_regionales(
 
             if not usar_cache:
                 try:
-                    ag_seg = run_fase4_desde_sabana(df_seg, modo_local=True)
+                    ag_seg = run_fase4_desde_sabana(
+                        df_seg,
+                        modo_local=True,
+                        niveles=NIVELES_POSGRADO,
+                        universo="posgrado",
+                    )
                 except Exception as e:
                     log_error(f"[Segmento {nombre}] Fase 4 falló: {e}")
                     continue
@@ -3035,11 +3231,15 @@ def _escribir_hoja_delta(
         log_warning(f"[Delta] No se pudo generar hoja de cambios: {e}")
 
 
-def run_fase5(agregado_df: pd.DataFrame | None) -> None:
+def run_fase5(
+    agregado_df: pd.DataFrame | None,
+    ag_pre: pd.DataFrame | None = None,
+) -> None:
     """
     Fase 5: Exportación formateada a Estudio_Mercado_Colombia.xlsx.
-    Hoja programas_detalle: sábana Fase 3 (freeze, filtros, anchos).
-    Hoja total: agregado Fase 4 con dos filas de encabezado y formato por bloque.
+    Hoja programas_detalle: sábana Fase 3 (freeze, filtros, anchos), solo posgrado.
+    Hoja total: agregado posgrado Fase 4 con dos filas de encabezado y formato por bloque.
+    Hoja total_pregrado (opcional): agregado pregrado, mismo formato.
     """
     from etl.config import ARCHIVO_ESTUDIO_MERCADO
 
@@ -3050,17 +3250,15 @@ def run_fase5(agregado_df: pd.DataFrame | None) -> None:
         return
     sabana = pd.read_parquet(sabana_path)
     # ── Filtro de niveles ────────────────────────────────────────────────────
-    # Garantiza que programas_detalle, resumen_ejecutivo y revision_requerida
-    # sean coherentes con la hoja total: solo aparecen los niveles activos en
-    # NIVELES_MERCADO. Cuando se quieran incluir pregrados u otros niveles,
-    # basta con ampliar esa lista en config.py.
+    # programas_detalle solo incluye programas de POSGRADO (ESP+MAE).
+    # Los pregrados se reportan exclusivamente en la hoja agregada total_pregrado.
     col_nivel = "NIVEL_DE_FORMACIÓN"
-    if col_nivel in sabana.columns and NIVELES_MERCADO:
+    if col_nivel in sabana.columns and NIVELES_POSGRADO:
         n_antes = len(sabana)
-        sabana = sabana[sabana[col_nivel].isin(NIVELES_MERCADO)].copy()
+        sabana = sabana[sabana[col_nivel].isin(NIVELES_POSGRADO)].copy()
         log_info(
-            f"[Fase 5] Filtro de niveles: {n_antes:,} → {len(sabana):,} programas "
-            f"exportados a programas_detalle."
+            f"[Fase 5] programas_detalle: filtrado a solo posgrado "
+            f"({len(sabana):,} de {n_antes:,} programas)."
         )
     if agregado_df is None or len(agregado_df) == 0:
         log_error("No hay DataFrame agregado. Ejecutar Fase 4 antes.")
@@ -3127,6 +3325,41 @@ def run_fase5(agregado_df: pd.DataFrame | None) -> None:
                         idx = list(sabana_final.columns).index(col_name) + 1
                         ws_detalle.column_dimensions[get_column_letter(idx)].width = width
                 _aplicar_formato_total(wb["total"], col_order)
+
+                # ── Hoja total_pregrado (144 categorías, solo UNIVERSITARIO) ──
+                # Sin merge incremental: no hay baseline anterior para esta hoja
+                # (es nueva tras la separación posgrado/pregrado).
+                if ag_pre is not None and len(ag_pre) > 0:
+                    try:
+                        ag_pre_export = ag_pre.copy()
+                        ag_pre_export["FECHA_EJECUCION"] = _fecha_eje
+                        col_order_pre = _escribir_hoja_total(
+                            writer, ag_pre_export, sheet_name="total_pregrado"
+                        )
+                        _aplicar_formato_total(wb["total_pregrado"], col_order_pre)
+                        # Reposicionar para que aparezca justo después de `total`
+                        try:
+                            _ws_pre = wb["total_pregrado"]
+                            _wb_sheets = wb._sheets  # API interna estable de openpyxl
+                            _wb_sheets.remove(_ws_pre)
+                            _idx_total = _wb_sheets.index(wb["total"])
+                            _wb_sheets.insert(_idx_total + 1, _ws_pre)
+                        except Exception as _e_ord:
+                            log_warning(
+                                f"[Fase 5] No se pudo reordenar total_pregrado: {_e_ord}"
+                            )
+                        log_info(
+                            f"✓ Hoja 'total_pregrado' escrita: "
+                            f"{len(ag_pre)} categorías (solo programas UNIVERSITARIO)."
+                        )
+                    except Exception as _e_pre:
+                        log_warning(
+                            f"[Fase 5] No se pudo escribir total_pregrado: {_e_pre}"
+                        )
+                else:
+                    log_info(
+                        "[Fase 5] ag_pre vacío o no provisto — hoja total_pregrado omitida."
+                    )
 
                 try:
                     _escribir_hoja_delta(writer, total_final)
@@ -3683,6 +3916,17 @@ def run_fase6(ag: pd.DataFrame, log) -> pd.DataFrame:
 
     df_eafit["NIVEL_FORMACION"] = df_eafit["PROGRAMA_EAFIT"].apply(_nivel)
 
+    # eafit_vs_mercado solo incluye programas de posgrado (ESP y MAE).
+    # Los programas UNIVERSITARIO de EAFIT tienen su propio análisis en total_pregrado
+    # (calibrado al universo pregrado, donde sus métricas son comparables).
+    _n_pre_eafit = (df_eafit["NIVEL_FORMACION"] == "Pregrado").sum()
+    df_eafit = df_eafit[df_eafit["NIVEL_FORMACION"] != "Pregrado"].reset_index(drop=True)
+    if _n_pre_eafit > 0:
+        log(
+            f"[Fase 6] Excluidos {_n_pre_eafit} programa(s) EAFIT de pregrado de "
+            "eafit_vs_mercado. Solo se incluyen Especialización y Maestría."
+        )
+
     if ag is None or len(ag) == 0:
         log("⚠ Fase 6: DataFrame 'ag' (hoja total) vacío. Se omite hoja.")
         return pd.DataFrame()
@@ -3948,8 +4192,14 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
     ws.auto_filter.ref = ws.dimensions
 
 
-def _escribir_hoja_total(writer: pd.ExcelWriter, ag: pd.DataFrame) -> list[str]:
-    """Escribe la hoja 'total' con fila 1 = bloques, fila 2 = nombres de columnas. Retorna orden de columnas."""
+def _escribir_hoja_total(
+    writer: pd.ExcelWriter,
+    ag: pd.DataFrame,
+    sheet_name: str = "total",
+) -> list[str]:
+    """Escribe una hoja con estructura idéntica a `total` (fila 1 = bloques, fila 2 = nombres
+    de columnas). El parámetro `sheet_name` permite reutilizar la lógica para `total_pregrado`.
+    Retorna el orden de columnas escritas."""
     from openpyxl.styles import Alignment as _Al
     from openpyxl.styles import Font as _Ft
     from openpyxl.styles import PatternFill as _PF
@@ -4002,7 +4252,12 @@ def _escribir_hoja_total(writer: pd.ExcelWriter, ag: pd.DataFrame) -> list[str]:
         "METADATA": "9E9E9E",
     }
     wb = writer.book
-    ws = wb.create_sheet("total", 1)
+    # Posición canónica de la hoja: `total` va en índice 1 (justo después de
+    # resumen_ejecutivo); `total_pregrado` se añade al final y luego se reordena.
+    if sheet_name == "total":
+        ws = wb.create_sheet(sheet_name, 1)
+    else:
+        ws = wb.create_sheet(sheet_name)
     col_order: list[str] = []
     col_idx = 1
     for block_name, cols in _BLOQUES_TOTAL:
@@ -4276,7 +4531,7 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
         from etl.config import OUTPUTS_DIR
 
         ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M")
-        ruta_salida = OUTPUTS_DIR / f"Base_Maestra_F1_{ts}.xlsx"
+        ruta_salida = OUTPUTS_DIR / f"Base_Programas_Categoria_F1_{ts}.xlsx"
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
 
     # ── Hoja de revisión requerida ───────────────────────────────────────────
@@ -4527,8 +4782,8 @@ def run_pipeline(
         else:
             run_fase3()
 
-    ag = run_fase4()
-    run_fase5(ag)
+    ag_pos, ag_pre = run_fase4()
+    run_fase5(ag_pos, ag_pre)
 
     elapsed = time.perf_counter() - t0
     log_resultado(f"Tiempo total: {elapsed:.1f}s")
@@ -4538,11 +4793,20 @@ def run_pipeline(
         n_prog = len(pd.read_parquet(sabana_path)) if sabana_path.exists() else 0
     except Exception:
         n_prog = 0
-    n_cat = len(ag) if ag is not None else 0
-    verdes = (ag["calificacion_final"] >= 4.0).sum() if ag is not None and "calificacion_final" in ag.columns else 0
-    amarillos = ((ag["calificacion_final"] >= 3.0) & (ag["calificacion_final"] < 4.0)).sum() if ag is not None and "calificacion_final" in ag.columns else 0
-    rojos = (ag["calificacion_final"] < 3.0).sum() if ag is not None and "calificacion_final" in ag.columns else 0
-    log_resultado(f"Programas: {n_prog}, Categorías: {n_cat}, Verde(>=4): {verdes}, Amarillo(>=3): {amarillos}, Rojo(<3): {rojos}")
+    n_cat = len(ag_pos) if ag_pos is not None else 0
+    if ag_pos is not None and "calificacion_final" in ag_pos.columns:
+        _cal = ag_pos["calificacion_final"]
+        verdes = int((_cal >= 4.0).sum())
+        amarillos = int(((_cal >= 3.0) & (_cal < 4.0)).sum())
+        rojos = int((_cal < 3.0).sum())
+    else:
+        verdes = amarillos = rojos = 0
+    n_cat_pre = len(ag_pre) if ag_pre is not None else 0
+    log_resultado(
+        f"Programas: {n_prog}, Categorías posgrado: {n_cat}, "
+        f"Categorías pregrado: {n_cat_pre}, "
+        f"Verde(>=4): {verdes}, Amarillo(>=3): {amarillos}, Rojo(<3): {rojos}"
+    )
     log_etapa_completada("Pipeline estudio de mercado Colombia", f"{elapsed:.1f}s")
 
 
@@ -4559,8 +4823,8 @@ def run_pipeline_mercado() -> None:
     run_fase1()
     run_fase2()
     run_fase3()
-    ag = run_fase4()
-    run_fase5(ag)
+    ag_pos, ag_pre = run_fase4()
+    run_fase5(ag_pos, ag_pre)
 
 
 if __name__ == "__main__":

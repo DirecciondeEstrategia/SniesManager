@@ -96,9 +96,9 @@ En `ref/`:
 
 `etl/config.py` puede leer un `config.json` junto a la raíz del proyecto (o la carpeta del `.exe`) para:
 
-- **`base_dir`**: carpeta raíz si quieres apuntar datos y salidas a otra ubicación.
-- **`outputs_dir`**, **`ref_dir`**, **`models_dir`**, **`docs_dir`**, **`logs_dir`**: rutas absolutas alternativas a los directorios por defecto.
-- **`umbral_referente`**: probabilidad mínima (0–1) para marcar un programa como referente en el clasificador; por defecto `0.70` si no se define.
+- `**base_dir**`: carpeta raíz si quieres apuntar datos y salidas a otra ubicación.
+- `**outputs_dir**`, `**ref_dir**`, `**models_dir**`, `**docs_dir**`, `**logs_dir**`: rutas absolutas alternativas a los directorios por defecto.
+- `**umbral_referente**`: probabilidad mínima (0–1) para marcar un programa como referente en el clasificador; por defecto `0.70` si no se define.
 
 Si el archivo no existe, se usan las rutas relativas habituales dentro del repositorio.
 
@@ -131,11 +131,11 @@ Las rutas se centralizan en `etl/config.py`. Algunas constantes útiles:
 ## Estudio de mercado — notas operativas
 
 - **Validación al arranque**: el pipeline de mercado ejecuta comprobaciones de archivos y carpetas mínimas antes de la Fase 2. Los **errores** bloquean la ejecución; las **advertencias** se registran y el proceso sigue (p. ej. años de matrícula faltantes OLE opcional).
-- **Fase 1 y Excel base maestra**: el checkpoint interno es `outputs/temp/base_maestra.parquet`. Desde la GUI, la exportación a Excel va por defecto a `outputs/estudio_de_mercado/Base_Maestra_F1_<fecha>.xlsx` (no hace falta elegir carpeta de destino manualmente).
+- **Fase 1 y Excel base programas-categoría**: el checkpoint interno es `outputs/temp/base_maestra.parquet`. Desde la GUI, la exportación a Excel va por defecto a `outputs/estudio_de_mercado/Base_Programas_Categoria_F1_<fecha>.xlsx` (no hace falta elegir carpeta de destino manualmente).
 - **Fase 3**: genera `outputs/temp/sabana_consolidada.parquet` (y limpia CSV intermedios en `outputs/historico/raw/` tras incorporarlos).
-- **Fase 4–5**: el agregado nacional se suele materializar en `outputs/temp/agregado_categorias.parquet`. El Excel nacional puede incluir la hoja **`cambios_vs_anterior`**, que compara contra el snapshot `outputs/temp/agregado_categorias_anterior.parquet` (en la primera corrida solo se crea el snapshot).
+- **Fase 4–5**: el agregado nacional se suele materializar en `outputs/temp/agregado_categorias.parquet`. El Excel nacional puede incluir la hoja `**cambios_vs_anterior`**, que compara contra el snapshot `outputs/temp/agregado_categorias_anterior.parquet` (en la primera corrida solo se crea el snapshot).
 - **Reportes segmentados** (`Estudio_Mercado_Bogota.xlsx`, `Estudio_Mercado_Antioquia.xlsx`, `Estudio_Mercado_Eje_Cafetero.xlsx`, `Estudio_Mercado_Virtual.xlsx`): recalculan métricas solo para ese subconjunto. El agregado por segmento puede **reutilizarse desde caché** (`outputs/temp/agregado_<nombre>.parquet`) si la sábana no cambió; en la pantalla de segmentos existe la opción de **forzar recálculo completo** para ignorar esa caché.
-- **Hojas útiles en el Excel nacional**: entre otras, `total`, `programas_detalle`, `resumen_ejecutivo`, `eafit_vs_mercado` (si aplica) y `cambios_vs_anterior`. En segmentos, además **`contexto_nacional`** compara el segmento con el agregado país.
+- **Hojas útiles en el Excel nacional**: entre otras, `total`, `programas_detalle`, `resumen_ejecutivo`, `eafit_vs_mercado` (si aplica) y `cambios_vs_anterior`. En segmentos, además `**contexto_nacional`** compara el segmento con el agregado país.
 
 ## Uso
 
@@ -203,9 +203,10 @@ Ver `requirements.txt` para el listado completo.
 
 ## Documentación adicional
 
-- **`ARCHIVOS_PROYECTO.md`**: inventario de entradas/salidas (SNIES + estudio de mercado).
-- **`GUIA_EMPAQUETADO.md`** y **`INSTRUCCIONES_EMPAQUETADO.md`**: PyInstaller y `SniesManager.exe`.
-- **`docs/ANALISIS_FLUJO_Y_EXCEPCIONES.md`**: flujos y manejo de errores (incluye mercado).
-- **`docs/MEJORAS_SISTEMA.md`**: backlog de mejoras técnicas.
-- **`tests/README.md`**: cómo ejecutar pruebas (incluye tests del pipeline de mercado).
-- **`DIAGNOSTICO_SISTEMA.md`**: informe puntual de diagnóstico; ver también `README` y `config.py` para el estado actual.
+- `**ARCHIVOS_PROYECTO.md`**: inventario de entradas/salidas (SNIES + estudio de mercado).
+- `**GUIA_EMPAQUETADO.md**` y `**INSTRUCCIONES_EMPAQUETADO.md**`: PyInstaller y `SniesManager.exe`.
+- `**docs/ANALISIS_FLUJO_Y_EXCEPCIONES.md**`: flujos y manejo de errores (incluye mercado).
+- `**docs/MEJORAS_SISTEMA.md**`: backlog de mejoras técnicas.
+- `**tests/README.md**`: cómo ejecutar pruebas (incluye tests del pipeline de mercado).
+- `**DIAGNOSTICO_SISTEMA.md**`: informe puntual de diagnóstico; ver también `README` y `config.py` para el estado actual.
+
