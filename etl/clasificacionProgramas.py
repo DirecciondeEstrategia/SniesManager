@@ -51,7 +51,7 @@ def _get_sentence_transformer():
             raise ImportError(error_msg) from e
     return _SentenceTransformer
 
-from etl.pipeline_logger import log_error, log_info, log_resultado
+from etl.pipeline_logger import log_error, log_info, log_resultado, log_warning
 from etl.config import (
     REF_DIR,
     MODELS_DIR,
@@ -1051,7 +1051,102 @@ def clasificar_programas_nuevos(
         raise ValueError(error_msg)
     
     df_nuevos = df_programas[df_programas['PROGRAMA_NUEVO'] == 'Sí'].copy()
-    
+
+    # ── BACKFILL: poblar ES_REFERENTE para programas ya conocidos en referentesUnificados ──
+    # Propósito: los 4,846 programas que están en referentesUnificados.csv con label=1
+    # nunca tuvieron ES_REFERENTE asignado porque ya eran PROGRAMA_NUEVO='No' cuando se
+    # instaló el pipeline automatizado. Este bloque los corrige en cada ejecución.
+    # Es idempotente: actúa solo sobre filas con ES_REFERENTE=NaN; en re-ejecuciones
+    # detecta que ya están asignados y no hace nada (log: "0 programas pendientes").
+    try:
+        _ruta_ref = get_archivo_referentes()
+        _df_ref = leer_datos_flexible(_ruta_ref)
+
+        # Filtrar solo label=1 si la columna existe
+        if 'label' in _df_ref.columns:
+            _df_ref = _df_ref[_df_ref['label'] == 1].copy()
+
+        _COL_SNIES = 'CÓDIGO_SNIES_DEL_PROGRAMA'
+        _COL_NOM   = 'NombrePrograma EAFIT'
+        _COL_COD   = 'Codigo EAFIT'
+
+        if _COL_SNIES in _df_ref.columns and _COL_NOM in _df_ref.columns:
+            # Normalizar códigos SNIES en referentesUnificados
+            _df_ref['_snorm'] = (
+                _df_ref[_COL_SNIES].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+            )
+            # Una sola entrada por código (keep='first' respeta el referente original)
+            _ref_dedup = _df_ref.drop_duplicates(subset=['_snorm'], keep='first').set_index('_snorm')
+
+            # Normalizar códigos en Programas.xlsx
+            _snies_prog = (
+                df_programas[_COL_SNIES]
+                .astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+            )
+
+            # Solo actuar sobre filas sin ES_REFERENTE aún asignado
+            _col_es_ref = 'ES_REFERENTE'
+            if _col_es_ref not in df_programas.columns:
+                df_programas[_col_es_ref] = None
+
+            _mask_pendiente = df_programas[_col_es_ref].isna()
+            _mask_en_ref    = _snies_prog.isin(_ref_dedup.index)
+            _mask_backfill  = _mask_pendiente & _mask_en_ref
+            _n              = _mask_backfill.sum()
+
+            if _n > 0:
+                # Asegurar columnas de clasificación
+                for _c, _default in [
+                    ('PROBABILIDAD',         0.0),
+                    ('PROGRAMA_EAFIT_CODIGO', None),
+                    ('PROGRAMA_EAFIT_NOMBRE', None),
+                ]:
+                    if _c not in df_programas.columns:
+                        df_programas[_c] = _default
+
+                _snies_bf = _snies_prog[_mask_backfill]
+
+                df_programas.loc[_mask_backfill, _col_es_ref]          = 'Sí'
+                df_programas.loc[_mask_backfill, 'PROBABILIDAD']        = 1.0
+                df_programas.loc[_mask_backfill, 'PROGRAMA_EAFIT_NOMBRE'] = (
+                    _snies_bf.map(_ref_dedup[_COL_NOM]).values
+                )
+                if _COL_COD in _ref_dedup.columns:
+                    df_programas.loc[_mask_backfill, 'PROGRAMA_EAFIT_CODIGO'] = (
+                        _snies_bf.map(_ref_dedup[_COL_COD]).values
+                    )
+
+                # Marcar como 'No' los que siguen sin asignar y son PROGRAMA_NUEVO='No'
+                # (para no dejarlos en NaN indefinidamente)
+                _mask_resto = (
+                    df_programas[_col_es_ref].isna() &
+                    (df_programas.get('PROGRAMA_NUEVO', 'No') == 'No')
+                )
+                df_programas.loc[_mask_resto, _col_es_ref] = 'No'
+                df_programas.loc[_mask_resto, 'PROBABILIDAD'] = (
+                    df_programas.loc[_mask_resto, 'PROBABILIDAD'].fillna(0.0)
+                )
+
+                log_info(
+                    f"[Backfill] {_n:,} programas marcados ES_REFERENTE='Sí' "
+                    f"por lookup en referentesUnificados "
+                    f"({_mask_resto.sum():,} marcados 'No')."
+                )
+                print(f"[Backfill] {_n:,} referentes conocidos asignados correctamente.")
+            else:
+                log_info("[Backfill] Sin programas pendientes — ES_REFERENTE ya poblado.")
+        else:
+            log_warning(
+                f"[Backfill] referentesUnificados no tiene columnas '{_COL_SNIES}' "
+                f"o '{_COL_NOM}'. Backfill omitido."
+            )
+    except Exception as _e_bf:
+        log_warning(
+            f"[Backfill] No se pudo aplicar: {_e_bf}. "
+            "Continuando con clasificación normal."
+        )
+    # ── FIN BACKFILL ──────────────────────────────────────────────────────────
+
     if len(df_nuevos) == 0:
         info_msg = "No hay programas nuevos para clasificar. Retornando DataFrame completo con todos los programas."
         print(info_msg)
@@ -1063,7 +1158,8 @@ def clasificar_programas_nuevos(
             if col not in df_programas.columns:
                 # Inicializar columnas con valores por defecto si no existen
                 if col == 'ES_REFERENTE':
-                    df_programas[col] = 'No'
+                    # fillna para no pisar los 'Sí' que el backfill ya asignó
+                    df_programas[col] = df_programas[col].fillna('No')
                 elif col == 'PROBABILIDAD':
                     df_programas[col] = 0.0
                 else:  # PROGRAMA_EAFIT_CODIGO o PROGRAMA_EAFIT_NOMBRE
