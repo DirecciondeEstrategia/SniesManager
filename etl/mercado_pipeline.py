@@ -154,10 +154,17 @@ def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
     {snies_norm -> total_anual (S1+S2)} indexada por código SNIES normalizado
     (misma lógica que _normalizar_codigo_snies).
     Retorna Series vacía si el archivo no existe o hay error.
+
+    Cobertura soportada: 2014–2024 (ref/backup/matriculas primer curso/).
+    Nombre esperado: `primer_curso_{year}.xlsx`.
+    El layout exacto del header se detecta dinámicamente buscando la fila
+    que contenga 'CODIGO' + 'SNIES' (header=5 sigue siendo la primera apuesta
+    rápida para archivos 2023/2024).
     """
+    pc_dir = ref_dir / "backup" / "matriculas primer curso"
     candidatos = [
+        pc_dir / f"primer_curso_{year}.xlsx",
         ref_dir / "backup" / f"primer_curso_{year}.xlsx",
-        ref_dir / "backup" / "matriculas primer curso" / f"primer_curso_{year}.xlsx",
         ref_dir / "backup" / "primer_curso" / f"primer_curso_{year}.xlsx",
         ref_dir / f"primer_curso_{year}.xlsx",
     ]
@@ -171,6 +178,12 @@ def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
 
     try:
         import openpyxl
+        import unicodedata as _ud
+
+        def _norm_up(s: str) -> str:
+            s2 = _ud.normalize("NFD", str(s))
+            s2 = "".join(ch for ch in s2 if _ud.category(ch) != "Mn")
+            return s2.upper().strip()
 
         wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
         try:
@@ -185,25 +198,49 @@ def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
         finally:
             wb.close()
 
-        df_pc = pd.read_excel(ruta, sheet_name=hoja, header=5, dtype=str, engine="openpyxl")
-        df_pc.columns = [str(c).strip() for c in df_pc.columns]
+        # Detección de columnas (tolerante a layouts viejos): primero probamos
+        # header=5 (rápido, confirmado para 2023/2024); si las columnas clave
+        # no aparecen, escaneamos las primeras 30 filas igual que el scraper.
+        def _detectar_columnas(df: pd.DataFrame) -> tuple[str | None, str | None, str | None]:
+            df.columns = [str(c).strip() for c in df.columns]
+            col_snies = next(
+                (c for c in df.columns if _norm_up(c).startswith("CODIGO") and "SNIES" in _norm_up(c)),
+                None,
+            ) or next(
+                (c for c in df.columns if "SNIES" in _norm_up(c) and "PROGRAMA" in _norm_up(c)),
+                None,
+            )
+            col_pc = next(
+                (c for c in df.columns if "MATRICULADOS" in _norm_up(c) and "PRIMER" in _norm_up(c)),
+                None,
+            ) or next(
+                (c for c in df.columns if "PRIMER" in _norm_up(c) and "CURSO" in _norm_up(c)),
+                None,
+            )
+            col_sem = next((c for c in df.columns if _norm_up(c) == "SEMESTRE"), None)
+            return col_snies, col_pc, col_sem
 
-        # Nombres confirmados en SNIES + fallback por substring (acentos / variantes)
-        col_snies = next(
-            (c for c in df_pc.columns if c == "CÓDIGO SNIES DEL PROGRAMA"),
-            None,
-        ) or next(
-            (c for c in df_pc.columns if "SNIES" in c.upper() and "PROGRAMA" in c.upper()),
-            None,
-        )
-        col_pc = next(
-            (c for c in df_pc.columns if c == "MATRICULADOS PRIMER CURSO"),
-            None,
-        ) or next(
-            (c for c in df_pc.columns if "PRIMER" in c.upper() and "CURSO" in c.upper()),
-            None,
-        )
-        col_sem = next((c for c in df_pc.columns if str(c).strip().upper() == "SEMESTRE"), None)
+        df_pc = pd.read_excel(ruta, sheet_name=hoja, header=5, dtype=str, engine="openpyxl")
+        col_snies, col_pc, col_sem = _detectar_columnas(df_pc)
+
+        if not col_snies or not col_pc:
+            # Fallback: detectar header dinámicamente
+            preview = pd.read_excel(
+                ruta, sheet_name=hoja, header=None, nrows=30, dtype=str, engine="openpyxl"
+            )
+            header_idx: int | None = None
+            for idx in range(len(preview)):
+                vals = [str(v) for v in preview.iloc[idx].tolist() if pd.notna(v) and str(v).strip()]
+                if not vals:
+                    continue
+                if "CODIGO" in _norm_up(vals[0]) and any("SNIES" in _norm_up(v) for v in vals):
+                    header_idx = idx
+                    break
+            if header_idx is not None and header_idx != 5:
+                df_pc = pd.read_excel(
+                    ruta, sheet_name=hoja, header=header_idx, dtype=str, engine="openpyxl"
+                )
+                col_snies, col_pc, col_sem = _detectar_columnas(df_pc)
 
         if not col_snies or not col_pc:
             log_warning(
@@ -382,7 +419,7 @@ def run_fase1() -> pd.DataFrame:
     Returns:
         DataFrame con todas las columnas de Programas + CATEGORIA_FINAL +
         FUENTE_CATEGORIA + TASA_COTIZANTES + SALARIO_OLE + INSCRITOS_2023 + INSCRITOS_2024
-        + PRIMER_CURSO_2023 + PRIMER_CURSO_2024 (desde ref/backup/primer_curso_*.xlsx).
+        + PRIMER_CURSO_2014..PRIMER_CURSO_2024 (desde ref/backup/matriculas primer curso/).
     """
     log_etapa_iniciada("Fase 1: Base maestra con categorías (ML)")
 
@@ -720,13 +757,15 @@ def run_fase1() -> pd.DataFrame:
         df_base.loc[mask_cruce_snies, "PROBABILIDAD"] = 1.0
         df_base.loc[mask_cruce_snies, "REQUIERE_REVISION"] = False
 
-    # ── Primer curso 2023 y 2024 ──────────────────────────────────────────────
-    # Fuente: ref/backup/primer_curso_{year}.xlsx (hoja de datos, header=5).
-    # Agrega S1+S2 por CÓDIGO_SNIES_DEL_PROGRAMA.
+    # ── Primer curso 2014–2024 ────────────────────────────────────────────────
+    # Fuente: ref/backup/matriculas primer curso/primer_curso_{year}.xlsx.
+    # Agrega S1+S2 por CÓDIGO_SNIES_DEL_PROGRAMA mediante _leer_primer_curso_anual,
+    # que detecta el header dinámicamente y tolera el archivo 2015 sin guión bajo.
     # Idempotente: borra la columna si ya existe antes de re-añadirla.
+    # Si un archivo no existe se loggea warning y la columna queda con NaN.
     _SNIES_COL = "CÓDIGO_SNIES_DEL_PROGRAMA"
     _snies_norm_base = _normalizar_codigo_snies(df_base[_SNIES_COL])
-    for _pc_year in (2023, 2024):
+    for _pc_year in range(2014, 2025):
         _col_out = f"PRIMER_CURSO_{_pc_year}"
         if _col_out in df_base.columns:
             df_base.drop(columns=[_col_out], inplace=True)
@@ -3398,147 +3437,11 @@ def run_fase5(
                 except Exception as e:
                     log_warning(f"[Gap] No se pudo generar hoja oportunidades_expansion: {e}")
 
-                # ── Análisis regional: una hoja por región ───────────────────
-                try:
-                    df_regional = run_analisis_regional(sabana_final, total_final)
-                    if df_regional is not None and len(df_regional) > 0:
-                        from openpyxl.styles import Alignment, Font, PatternFill
-                        from openpyxl.utils import get_column_letter
-
-                        # Columnas a mostrar en cada tabla regional (en este orden)
-                        COLS_REGION = [
-                            "DEPARTAMENTO",
-                            "CATEGORIA_FINAL",
-                            "suma_matricula_regional_2024",
-                            "pct_mercado_regional",
-                            "AAGR_regional",
-                            "AAGR_nacional",
-                            "calificacion_nacional",
-                            "salario_promedio_regional",
-                            "num_programas_regional_2024",
-                        ]
-                        HEADERS = [
-                            "Departamento",
-                            "Categoría de mercado",
-                            "Matrícula regional 2024",
-                            "% del mercado nacional",
-                            "AAGR regional",
-                            "AAGR nacional",
-                            "Calificación nacional",
-                            "Salario promedio (SMLMV)",
-                            "N° programas",
-                        ]
-                        COL_WIDTHS = [22, 38, 24, 22, 16, 16, 22, 24, 14]
-
-                        # Colores de encabezado por región
-                        REGION_COLORS = {
-                            "Bogotá":      "1F4E79",
-                            "Eje Andino":  "2E75B6",
-                            "Pacífico":    "0070C0",
-                            "Nororiente":  "375623",
-                            "Caribe":      "7E6000",
-                            "Centro-Sur":  "843C0C",
-                            "Llanos":      "7030A0",
-                            "Amazonía":    "2F5496",
-                        }
-
-                        df_suf = df_regional[~df_regional["DATOS_INSUFICIENTES"]].copy()
-                        regiones = [r for r in _REGION_ORDEN if r in df_suf["REGION"].values]
-
-                        for region in regiones:
-                            df_r = df_suf[df_suf["REGION"] == region].copy()
-                            # Nombre de hoja: máx 31 chars, sin caracteres especiales
-                            sheet_name = f"Regional_{region}"[:31]
-                            cols_existentes = [c for c in COLS_REGION if c in df_r.columns]
-                            headers_existentes = [HEADERS[COLS_REGION.index(c)] for c in cols_existentes]
-                            widths_existentes  = [COL_WIDTHS[COLS_REGION.index(c)] for c in cols_existentes]
-
-                            df_export = df_r[cols_existentes].copy()
-
-                            # Formatear porcentajes y decimales como números (Excel los formatea)
-                            for c in ["pct_mercado_regional", "AAGR_regional", "AAGR_nacional"]:
-                                if c in df_export.columns:
-                                    df_export[c] = pd.to_numeric(df_export[c], errors="coerce")
-
-                            df_export.to_excel(writer, sheet_name=sheet_name, index=False, startrow=2)
-                            ws = writer.book[sheet_name]
-
-                            # ── Título de región (fila 1) ──────────────────────
-                            color_enc = REGION_COLORS.get(region, "1F4E79")
-                            ws.merge_cells(start_row=1, start_column=1,
-                                           end_row=1, end_column=len(cols_existentes))
-                            titulo_cell = ws.cell(row=1, column=1)
-                            titulo_cell.value = f"Región {region} — Mercado de Especializaciones y Maestrías"
-                            titulo_cell.font = Font(bold=True, size=13, color="FFFFFF")
-                            titulo_cell.fill = PatternFill(start_color=color_enc, end_color=color_enc, fill_type="solid")
-                            titulo_cell.alignment = Alignment(horizontal="left", vertical="center")
-                            ws.row_dimensions[1].height = 22
-
-                            # ── Encabezados de columna (fila 3, sobre los datos) ──
-                            for ci, header in enumerate(headers_existentes, start=1):
-                                cell = ws.cell(row=3, column=ci)
-                                cell.value = header
-                                cell.font = Font(bold=True, size=10, color="FFFFFF")
-                                cell.fill = PatternFill(start_color=color_enc, end_color=color_enc, fill_type="solid")
-                                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                            ws.row_dimensions[3].height = 30
-
-                            # ── Formato de datos ──────────────────────────────
-                            from openpyxl.styles import numbers as xl_numbers
-                            PCT_FMT  = "0.0%"
-                            NUM_FMT  = "#,##0"
-                            DEC_FMT  = "0.00"
-
-                            col_formats = {}
-                            for ci, col in enumerate(cols_existentes, start=1):
-                                if col in ("pct_mercado_regional", "AAGR_regional", "AAGR_nacional"):
-                                    col_formats[ci] = PCT_FMT
-                                elif col in ("suma_matricula_regional_2024", "num_programas_regional_2024",
-                                             "suma_matricula_nacional_2024"):
-                                    col_formats[ci] = NUM_FMT
-                                elif col in ("calificacion_nacional", "salario_promedio_regional"):
-                                    col_formats[ci] = DEC_FMT
-
-                            # Filas alternas + semáforo en calificacion_nacional
-                            cal_col_idx = cols_existentes.index("calificacion_nacional") + 1 if "calificacion_nacional" in cols_existentes else None
-                            VERDE_F  = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-                            AMARI_F  = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-                            ROJO_F   = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-                            GRIS_F   = PatternFill(start_color="F4F4F4", end_color="F4F4F4", fill_type="solid")
-
-                            for ri in range(4, ws.max_row + 1):  # datos empiezan en fila 4 (startrow=2 + 1 header)
-                                fila_fill = GRIS_F if (ri % 2 == 0) else None
-                                for ci in range(1, len(cols_existentes) + 1):
-                                    cell = ws.cell(row=ri, column=ci)
-                                    if col_formats.get(ci):
-                                        cell.number_format = col_formats[ci]
-                                    if fila_fill:
-                                        cell.fill = fila_fill
-                                # Semáforo en columna calificación_nacional
-                                if cal_col_idx:
-                                    cal_cell = ws.cell(row=ri, column=cal_col_idx)
-                                    try:
-                                        val = float(cal_cell.value) if cal_cell.value is not None else None
-                                        if val is not None:
-                                            cal_cell.fill = VERDE_F if val >= 4.0 else (AMARI_F if val >= 3.0 else ROJO_F)
-                                    except (TypeError, ValueError):
-                                        pass
-
-                            # ── Anchos de columna ─────────────────────────────
-                            for ci, w in enumerate(widths_existentes, start=1):
-                                ws.column_dimensions[get_column_letter(ci)].width = w
-
-                            # ── Freeze y autofiltro ───────────────────────────
-                            ws.freeze_panes = "A4"
-                            ws.auto_filter.ref = f"A3:{get_column_letter(len(cols_existentes))}3"
-
-                            log_info(f"  ✓ Hoja '{sheet_name}': {len(df_export):,} filas.")
-
-                        log_info(f"✓ {len(regiones)} hojas regionales creadas.")
-                    else:
-                        log_warning("⚠ Análisis regional omitido — sin datos.")
-                except Exception as e:
-                    log_warning(f"[Regional] No se pudo generar hojas regionales: {e}")
+                # ── Hojas Regional_* desactivadas ─────────────────────────────
+                # Los Excel regionales separados (Estudio_Mercado_<Region>.xlsx) ya
+                # cubren este análisis; las hojas Regional_* dentro del Excel Colombia
+                # eran redundantes y pesadas. `run_analisis_regional()` sigue definida
+                # más arriba por si se necesita reactivar este bloque a futuro.
 
                 # Hoja informativa: programas con baja confianza del ML (REQUIERE_REVISION == True)
                 if "REQUIERE_REVISION" in sabana_final.columns:

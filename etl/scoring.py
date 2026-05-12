@@ -29,13 +29,13 @@ _SCORE_MAT_P40: float = 5.4
 _SCORE_MAT_P60: float = 8.5
 _SCORE_MAT_P80: float = 13.8
 
-# score_matricula — PREGRADO (prom_primer_curso_2024 por categoría, 144 cats Colombia)
-# Universo: programas UNIVERSITARIO dentro de las 144 categorías que los contienen.
-# Distribución real: P20=22 P40=34 P60=49 P80=83 (~10× mayor que posgrado)
-_SCORE_MAT_PRE_P20: float = 22.0
-_SCORE_MAT_PRE_P40: float = 34.0
-_SCORE_MAT_PRE_P60: float = 49.5
-_SCORE_MAT_PRE_P80: float = 83.0
+# score_matricula — PREGRADO (prom_primer_curso_2024, 146 cats Colombia real)
+# Distribución real: P20=15.3 P40=28.5 P60=44.6 P80=74.0
+# (thresholds anteriores 22/34/49/83 estaban calibrados con estimación pre-pipeline)
+_SCORE_MAT_PRE_P20: float = 15.0
+_SCORE_MAT_PRE_P40: float = 28.5
+_SCORE_MAT_PRE_P60: float = 44.5
+_SCORE_MAT_PRE_P80: float = 74.0
 
 # score_AAGR — árbol de decisión para POSGRADO ─────────────────────────────────
 # ESP (categorías con NIVEL_MAYORIT ∈ {ESPECIALIZACIÓN, ESP.MED.QUIR, ESP.TEC, ESP.TEC.PRO})
@@ -48,10 +48,11 @@ _AAGR_ESP_THRESHOLDS: list[tuple[float, int]] = [
 _AAGR_MAE_THRESHOLDS: list[tuple[float, int]] = [
     (-0.021, 1), (0.032, 2), (0.074, 3), (0.163, 4)
 ]
-# PREGRADO: mercado maduro, distribución centrada en crecimiento bajo
-# Distribución: P20=-1.9% P40=0.8% P60=3.4% P80=8.2%
+# score_AAGR — PREGRADO (119 cats con AAGR válido)
+# P20=-0.36% P40=1.9% P60=6.4% P80=12.0%
+# (thresholds anteriores basados en estimación; reales más centrados en 0)
 _AAGR_PRE_THRESHOLDS: list[tuple[float, int]] = [
-    (-0.019, 1), (0.008, 2), (0.034, 3), (0.082, 4)
+    (-0.0036, 1), (0.019, 2), (0.064, 3), (0.120, 4)
 ]
 
 # Umbrales: lista de (límite_superior_inclusivo, score). Valores por encima del último → score 5 (o 1 si inverse).
@@ -104,14 +105,14 @@ SCORING_CONFIG = [
 
 
 # ── Configuración de scoring para universo PREGRADO ──────────────────────────
-# Todos los thresholds calibrados sobre 144 categorías con programas UNIVERSITARIO.
+# Todos los thresholds calibrados sobre 146 categorías con programas UNIVERSITARIO.
 # Pesos idénticos al posgrado para mantener comparabilidad de estructura.
 SCORING_CONFIG_PREGRADO: list[dict] = [
     {
         "col": "AAGR_ROBUSTO",
         "out": "score_AAGR",
         "peso": 0.20,
-        # Mercado maduro: P20=-1.9% P40=0.8% P60=3.4% P80=8.2%
+        # Real pipeline (119 cats con AAGR válido): P20=-0.36% P40=1.9% P60=6.4% P80=12.0%
         "thresholds": _AAGR_PRE_THRESHOLDS,
         "inverse": False,
     },
@@ -119,24 +120,29 @@ SCORING_CONFIG_PREGRADO: list[dict] = [
         "col": "salario_promedio_smlmv",
         "out": "score_salario",
         "peso": 0.15,
-        # P20=2.76 P40=3.30 P60=3.90 P80=5.28 SMLMV (escala entrada laboral)
-        "thresholds": [(2.0, 1), (2.76, 2), (3.30, 3), (3.90, 4)],
+        # P20=2.79 P40=3.31 P60=3.94 P80=5.33 SMLMV (real pipeline, 143 cats)
+        # Thresholds = percentiles exactos → distribución uniforme {29,29,29,29,29}.
+        # Anterior (2.0,1) bajaba demasiado el corte inferior (P10=2.54) y juntaba
+        # P40→P80 en un solo bucket (score 4 con 57 cats / 40%).
+        "thresholds": [(2.79, 1), (3.31, 2), (3.94, 3), (5.33, 4)],
         "inverse": False,
     },
     {
         "col": "pct_no_matriculados_2024",
         "out": "score_pct_no_matriculados",
         "peso": 0.10,
-        # P20=0.27 P40=0.34 P60=0.41 P80=0.48 (similar a posgrado, escala relativa)
-        "thresholds": [(0.27, 5), (0.34, 4), (0.41, 3), (0.48, 2)],
+        # P20=0.273 P40=0.408 P60=0.509 P80=0.623 (real pipeline, 146 cats)
+        # Anterior: P80=0.48 causaba 66 cats en score 1 (45%) — umbral demasiado bajo
+        "thresholds": [(0.273, 5), (0.408, 4), (0.509, 3), (0.623, 2)],
         "inverse": True,
     },
     {
         "col": "num_programas_2024",
         "out": "score_num_programas",
         "peso": 0.05,
-        # P20=2 P40=7 P60=25 P80=57 (distribución más polarizada que posgrado)
-        "thresholds": [(2, 5), (7, 4), (25, 3), (57, 2)],
+        # P20=1 P40=5 P60=19 P80=55 (real pipeline, 146 cats)
+        # Anterior: P20=2 causaba 43 cats en score 5 (29%) — 20% ideal
+        "thresholds": [(1, 5), (5, 4), (19, 3), (55, 2)],
         "inverse": True,
     },
     {
