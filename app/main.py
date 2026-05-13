@@ -109,6 +109,59 @@ def explain_file_in_use() -> str:
     )
 
 
+def bind_tooltip(widget: tk.Misc, text: str, delay_ms: int = 450) -> None:
+    """Muestra un tooltip flotante al pasar el mouse (sin dependencias extra)."""
+    state: dict[str, tk.Toplevel | str | None] = {"win": None, "after_id": None}
+
+    def _destroy() -> None:
+        aid = state.get("after_id")
+        if aid is not None:
+            try:
+                widget.after_cancel(aid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            state["after_id"] = None
+        tw = state.get("win")
+        if tw is not None:
+            try:
+                tw.destroy()
+            except tk.TclError:
+                pass
+            state["win"] = None
+
+    def _show() -> None:
+        _destroy()
+        try:
+            x = int(widget.winfo_rootx()) + 12
+            y = int(widget.winfo_rooty()) + int(widget.winfo_height()) + 6
+        except tk.TclError:
+            return
+        tw = tk.Toplevel(widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        state["win"] = tw
+        tw.configure(bg="#1e293b")
+        tk.Label(
+            tw,
+            text=text,
+            justify="left",
+            background="#1e293b",
+            foreground="#f8fafc",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=8,
+            wraplength=300,
+        ).pack()
+
+    def _schedule(_event=None) -> None:
+        _destroy()
+        state["after_id"] = widget.after(delay_ms, _show)
+
+    widget.bind("<Enter>", _schedule, add="+")
+    widget.bind("<Leave>", lambda _e: _destroy(), add="+")
+    widget.bind("<ButtonPress>", lambda _e: _destroy(), add="+")
+
+
 def safe_messagebox_error(title: str, msg: str, parent: tk.Misc | None = None) -> None:
     try:
         messagebox.showerror(title, msg, parent=parent)
@@ -3207,27 +3260,50 @@ class MainMenuGUI:
         # === COLUMNA IZQUIERDA ===
         
         # Card: Acción principal (más destacada y limpia)
-        primary_action_card = ttk.Frame(left_column, padding=28, style="Card.TFrame")
-        primary_action_card.pack(fill=tk.X, pady=(0, 24))
+        self.primary_action_card = ttk.Frame(left_column, padding=28, style="Card.TFrame")
+        self.primary_action_card.pack(fill=tk.X, pady=(0, 24))
         
         # Botón principal más grande y destacado
         primary_btn = ttk.Button(
-            primary_action_card,
+            self.primary_action_card,
             text="▶️ Ejecutar análisis SNIES (Pipeline)",
             command=self._open_pipeline,
             style="Primary.TButton",
         )
         primary_btn.pack(fill=tk.X, pady=(0, 12))
+        bind_tooltip(
+            primary_btn,
+            "Descarga datos SNIES, normaliza nombres y campos, detecta programas nuevos y "
+            "clasifica cada programa con el modelo ML. Genera outputs/Programas.xlsx.",
+        )
         
         # Descripción con wraplength dinámico (se actualizará en _update_responsive)
         self.primary_desc_label = ttk.Label(
-            primary_action_card,
+            self.primary_action_card,
             text="Descarga desde SNIES, normaliza y clasifica programas académicos.",
             style="Muted.TLabel",
             wraplength=400,  # Valor inicial, se actualizará dinámicamente
             justify="left",
         )
         self.primary_desc_label.pack(anchor="w", fill=tk.X)
+        
+        # Card: Próximos pasos (solo visible cuando falta algo clave)
+        self.empty_state_card = ttk.Frame(left_column, padding=20, style="Card.TFrame")
+        self.empty_state_title = ttk.Label(
+            self.empty_state_card,
+            text="📌 Próximos pasos",
+            style="SectionTitle.TLabel",
+        )
+        self.empty_state_title.pack(anchor="w", pady=(0, 8))
+        self.empty_state_body = ttk.Label(
+            self.empty_state_card,
+            text="",
+            style="Muted.TLabel",
+            wraplength=400,
+            justify="left",
+        )
+        self.empty_state_body.pack(anchor="w", fill=tk.X)
+        # Empaquetado condicional desde _refresh_empty_state_hints()
         
         # Card: Otras acciones (más compactas y limpias)
         other_actions_card = ttk.Frame(left_column, padding=28, style="Card.TFrame")
@@ -3242,11 +3318,21 @@ class MainMenuGUI:
         
         self._action_desc_labels = []  # Para actualización responsive
         
-        def compact_action_row(title: str, desc: str, cmd, icon: str = ""):
+        def compact_action_row(
+            title: str,
+            desc: str,
+            cmd,
+            icon: str = "",
+            style: str = "Secondary.TButton",
+            tooltip: str | None = None,
+        ):
             row = ttk.Frame(other_actions_card, style="Card.TFrame")
             row.pack(fill=tk.X, pady=(0, 14))
             btn_text = f"{icon} {title}" if icon else title
-            ttk.Button(row, text=btn_text, command=cmd, style="Secondary.TButton").pack(fill=tk.X)
+            btn = ttk.Button(row, text=btn_text, command=cmd, style=style)
+            btn.pack(fill=tk.X)
+            if tooltip:
+                bind_tooltip(btn, tooltip)
             # Descripción más pequeña y discreta con wraplength dinámico
             desc_label = ttk.Label(
                 row, 
@@ -3264,31 +3350,30 @@ class MainMenuGUI:
             "Revisa y corrige ES_REFERENTE y programa EAFIT.",
             self._open_manual,
             icon="✏️",
-        )
-        compact_action_row(
-            "Reentrenamiento del modelo",
-            "Edita referentes y reentrena el modelo.",
-            self._open_retrain,
-            icon="🎯",
-        )
-        compact_action_row(
-            "Consolidar archivos (Merge)",
-            "Combina Programas.xlsx con un histórico.",
-            self._open_merge,
-            icon="🔀",
+            tooltip="Abre la tabla de Programas.xlsx para marcar referentes, corregir falsos positivos "
+            "y asociar cada programa SNIES al programa EAFIT correspondiente.",
         )
         compact_action_row(
             "Revisión de Áreas",
             "Imputa valores faltantes en ÁREA_DE_CONOCIMIENTO usando IA.",
             self._open_imputacion,
             icon="🤖",
+            tooltip="Completa el campo ÁREA_DE_CONOCIMIENTO cuando falta, usando el modelo de imputación. "
+            "Los cambios se guardan en Programas.xlsx.",
         )
         compact_action_row(
-            "Estudio de mercado Colombia",
+            "Indicador de oportunidad de portafolio",
             "Pipeline de agregación por categoría y exportación a Estudio_Mercado_Colombia.xlsx.",
             self._open_mercado,
             icon="📊",
+            style="Primary.TButton",
+            tooltip="Fase 1: base programas×categoría. Fases 2–5: matrículas, OLE, scoring y Excel nacional. "
+            "Requiere Programas.xlsx del pipeline SNIES.",
         )
+        # NOTA: "Reentrenamiento del modelo" se movió a la sección Utilidades.
+        # "Consolidar archivos (Merge)" se oculta temporalmente (no se está usando).
+        # Las callbacks self._open_retrain y self._open_merge se conservan por
+        # si en el futuro se necesita reactivar cualquiera de las dos acciones.
 
         # Card: Configuración (más compacta y limpia)
         config_card = ttk.Frame(left_column, padding=28, style="Card.TFrame")
@@ -3341,18 +3426,29 @@ class MainMenuGUI:
         health_btn_frame = ttk.Frame(health_card, style="Card.TFrame")
         health_btn_frame.pack(fill=tk.X)
         
-        ttk.Button(
+        btn_verify_health = ttk.Button(
             health_btn_frame,
             text="🔍 Verificar",
             command=self._run_health_check,
             style="Small.TButton",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        ttk.Button(
+        )
+        btn_verify_health.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        bind_tooltip(
+            btn_verify_health,
+            "Comprueba Internet, archivos en ref/, modelos ML cargables y permisos de escritura en outputs/.",
+        )
+        btn_repair_health = ttk.Button(
             health_btn_frame,
             text="🔧 Reparar",
             command=self._repair_system,
             style="Small.TButton",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        )
+        btn_repair_health.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        bind_tooltip(
+            btn_repair_health,
+            "Según el último Verificar: sugiere pasos o abre reentrenamiento si faltan modelos ML. "
+            "No modifica archivos automáticamente salvo que confirmes ir a reentrenar.",
+        )
         
         # Ejecutar health check automáticamente al abrir
         self.root.after_idle(lambda: self.root.after(1500, self._run_health_check))
@@ -3373,24 +3469,38 @@ class MainMenuGUI:
         
         # Botones con textos completos y mejor organización
         util_buttons_data = [
-            ("📋 Ver logs", self._open_logs),
-            ("🔓 Desbloquear", self._unlock_if_needed),
-            ("📂 Outputs", self._open_outputs),
-            ("📊 Programas.xlsx", self._open_programas),
+            ("📋 Ver logs", self._open_logs, "Abre logs/pipeline.log con la aplicación predeterminada."),
+            ("🔓 Desbloquear", self._unlock_if_needed, "Quita .pipeline.lock si quedó un bloqueo huérfano tras un cierre inesperado."),
+            ("📂 Outputs", self._open_outputs, "Abre la carpeta outputs/ del proyecto en el explorador de archivos."),
+            (
+                "📊 Revisar programas y categorías",
+                self._open_base_programas_categorias,
+                "Abre el Excel más reciente Base_Programas_Categoria_F1_*.xlsx generado en la Fase 1 del indicador.",
+            ),
+            ("🎯 Reentrenar modelo", self._open_retrain, "Página para editar referentes y reentrenar el modelo de clasificación ML."),
         ]
         
         self._util_buttons = []
-        for text, cmd in util_buttons_data:
+        for text, cmd, tip in util_buttons_data:
             btn = ttk.Button(self.util_btns, text=text, command=cmd, style="Small.TButton")
+            bind_tooltip(btn, tip)
             self._util_buttons.append(btn)
         
-        # Organizar botones en grid de 2 columnas con mejor espaciado
+        # Organizar botones en grid de 2 columnas con mejor espaciado.
+        # Si la cantidad de botones es impar, el último ocupa la fila completa
+        # para evitar que quede una celda vacía a su derecha.
+        n_btns = len(self._util_buttons)
+        last_alone = n_btns % 2 == 1
         for i, btn in enumerate(self._util_buttons):
             row = i // 2
             col = i % 2
-            padx_right = 8 if col == 0 else 0
-            pady_bottom = 8 if row < (len(self._util_buttons) - 1) // 2 else 0
-            btn.grid(row=row, column=col, sticky="ew", padx=(0, padx_right), pady=(0, pady_bottom))
+            is_last_alone = last_alone and i == n_btns - 1
+            pady_bottom = 8 if row < (n_btns - 1) // 2 else 0
+            if is_last_alone:
+                btn.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(0, pady_bottom))
+            else:
+                padx_right = 8 if col == 0 else 0
+                btn.grid(row=row, column=col, sticky="ew", padx=(0, padx_right), pady=(0, pady_bottom))
         
         # Configurar columnas para distribución uniforme
         self.util_btns.columnconfigure(0, weight=1, uniform="util_col")
@@ -3412,10 +3522,10 @@ class MainMenuGUI:
         flow_steps.pack(fill=tk.X)
         
         steps_data = [
-            ("1", "Pipeline"),
+            ("1", "Pipeline SNIES"),
             ("2", "Imputar (IA)"),
-            ("3", "Ajuste"),
-            ("4", "Consolidar")
+            ("3", "Ajuste manual"),
+            ("4", "Indicador portafolio"),
         ]
         
         for i, (num, text) in enumerate(steps_data):
@@ -3567,6 +3677,12 @@ class MainMenuGUI:
                             label.configure(wraplength=wraplen_column)
                         except (tk.TclError, AttributeError):
                             pass
+
+                if hasattr(self, "empty_state_body"):
+                    try:
+                        self.empty_state_body.configure(wraplength=wraplen_column)
+                    except (tk.TclError, AttributeError):
+                        pass
                 
                 # Actualizar labels de estado del sistema si existen
                 if hasattr(self, 'health_status_labels'):
@@ -3691,6 +3807,54 @@ class MainMenuGUI:
         except Exception:
             # Si falla, no bloquear la aplicación
             pass
+        try:
+            self._refresh_empty_state_hints()
+        except Exception:
+            pass
+
+    def _refresh_empty_state_hints(self) -> None:
+        """Muestra u oculta la tarjeta «Próximos pasos» según archivos clave del proyecto."""
+        if not hasattr(self, "empty_state_card"):
+            return
+        try:
+            bd = get_configured_base_dir()
+            lines: list[str] = []
+            if not bd:
+                lines.append("• Configura la carpeta del proyecto (sección «Configuración», más abajo en esta pantalla).")
+            else:
+                from etl.normalizacion import ARCHIVO_PROGRAMAS
+
+                if not ARCHIVO_PROGRAMAS.exists():
+                    lines.append(
+                        "• Ejecuta «Pipeline SNIES» (botón principal arriba) para generar outputs/Programas.xlsx."
+                    )
+                else:
+                    try:
+                        from etl.config import ESTUDIO_MERCADO_DIR
+
+                        if ESTUDIO_MERCADO_DIR.exists():
+                            hay_base = any(ESTUDIO_MERCADO_DIR.glob("Base_Programas_Categoria_F1_*.xlsx"))
+                        else:
+                            hay_base = False
+                    except Exception:
+                        hay_base = False
+                    if not hay_base:
+                        lines.append(
+                            "• Abre «Indicador de oportunidad de portafolio» y ejecuta la Fase 1 para generar "
+                            "Base_Programas_Categoria_F1_*.xlsx (programas y categorías)."
+                        )
+            if not lines:
+                self.empty_state_card.pack_forget()
+                return
+            body = "\n".join(lines) + "\n\nCuando completes estos pasos, esta tarjeta se ocultará sola."
+            self.empty_state_body.config(text=body)
+            try:
+                self.empty_state_card.pack(fill=tk.X, pady=(0, 16), after=self.primary_action_card)
+            except tk.TclError:
+                self.empty_state_card.pack(fill=tk.X, pady=(0, 16))
+            self.root.after_idle(self._update_responsive)
+        except Exception:
+            pass
 
     def _configure(self):
         # Forzar selección de carpeta
@@ -3712,7 +3876,8 @@ class MainMenuGUI:
             self.status_label.config(text="Estado: listo")
         # Re-ejecutar health check después de configurar
         self.root.after(500, self._run_health_check)
-    
+        self.root.after(600, self._refresh_empty_state_hints)
+
     def _run_health_check(self):
         """Ejecuta diagnóstico del sistema y muestra resultados."""
         # Limpiar frame de health
@@ -3941,6 +4106,7 @@ class MainMenuGUI:
         self.root.minsize(800, 500)
         self._refresh_base_dir()
         self.root.update_idletasks()
+        self.root.after(200, self._refresh_empty_state_hints)
 
     def _open_pipeline(self):
         if not ensure_base_dir(self.root, prompt_if_missing=True):
@@ -4039,6 +4205,46 @@ class MainMenuGUI:
             _open_in_excel(p)
         except Exception as exc:
             safe_messagebox_error("Error", str(exc), parent=self.root)
+
+    def _open_base_programas_categorias(self):
+        """Abre el archivo Base_Programas_Categoria_F1_*.xlsx más reciente
+        generado por la Fase 1 del pipeline de estudio de mercado.
+        """
+        if not ensure_base_dir(self.root, prompt_if_missing=True):
+            return
+        try:
+            from etl.config import ESTUDIO_MERCADO_DIR  # Lazy import
+        except Exception as exc:
+            safe_messagebox_error("Error", f"No se pudo localizar la carpeta de estudio de mercado:\n{exc}", parent=self.root)
+            return
+
+        if not ESTUDIO_MERCADO_DIR.exists():
+            safe_messagebox_error(
+                "Atención",
+                "Aún no existe la carpeta de estudio de mercado.\n"
+                "Ejecuta primero la Fase 1 del Indicador de oportunidad de portafolio.",
+                parent=self.root,
+            )
+            return
+
+        candidatos = sorted(
+            ESTUDIO_MERCADO_DIR.glob("Base_Programas_Categoria_F1_*.xlsx"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidatos:
+            safe_messagebox_error(
+                "Atención",
+                "No se encontró ningún archivo Base_Programas_Categoria_F1_*.xlsx.\n"
+                "Ejecuta primero la Fase 1 del Indicador de oportunidad de portafolio.",
+                parent=self.root,
+            )
+            return
+
+        try:
+            _open_in_excel(candidatos[0])
+        except Exception as exc:
+            safe_messagebox_error("Error", str(exc), parent=self.root)
     
 class PipelinePage(ttk.Frame):
     """Interfaz gráfica para el pipeline de análisis SNIES."""
@@ -4080,7 +4286,13 @@ class PipelinePage(ttk.Frame):
         title_frame.pack(fill=tk.X, pady=(0, 20))
         ttk.Label(title_frame, text="▶️ Pipeline de Análisis SNIES", style="Header.TLabel").pack(side=tk.LEFT)
         if self.on_back:
-            ttk.Button(title_frame, text="← Volver al menú", command=lambda: self.on_back() if self.on_back else None, style="Back.TButton").pack(side=tk.RIGHT)
+            self.btn_pipeline_back = ttk.Button(
+                title_frame,
+                text="← Volver al menú",
+                command=lambda: self.on_back() if self.on_back else None,
+                style="Back.TButton",
+            )
+            self.btn_pipeline_back.pack(side=tk.RIGHT)
         
         # Card: Carpeta del proyecto mejorada
         dir_card = ttk.Frame(main_frame, padding=16, style="Card.TFrame")
@@ -4088,8 +4300,8 @@ class PipelinePage(ttk.Frame):
         ttk.Label(dir_card, text="📁 Carpeta del proyecto", style="SectionTitle.TLabel").pack(anchor="w")
         self.dir_label = ttk.Label(dir_card, text="No configurado", style="Muted.TLabel")
         self.dir_label.pack(anchor="w", pady=(8, 10))
-        btn_change_dir = ttk.Button(dir_card, text="📂 Cambiar carpeta", command=self._select_base_directory, style="Secondary.TButton")
-        btn_change_dir.pack(anchor="w")
+        self.btn_change_dir = ttk.Button(dir_card, text="📂 Cambiar carpeta", command=self._select_base_directory, style="Secondary.TButton")
+        self.btn_change_dir.pack(anchor="w")
         
         # Card: Ejecución mejorada
         run_card = ttk.Frame(main_frame, padding=16, style="Card.TFrame")
@@ -4337,6 +4549,16 @@ class PipelinePage(ttk.Frame):
         self.cancel_event.clear()  # Resetear el evento de cancelación
         self.btn_execute.config(state=tk.DISABLED)
         self.btn_cancel.config(state=tk.NORMAL)
+        self.btn_validar.config(state=tk.DISABLED)
+        self.btn_change_dir.config(state=tk.DISABLED)
+        try:
+            self.btn_pipeline_back.config(state=tk.DISABLED)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self.root.config(cursor="watch")
+        except tk.TclError:
+            pass
         self._update_status("Procesando...", "orange")
         self._log_message("=" * 50)
         self._log_message("Iniciando ejecución del pipeline...")
@@ -4407,6 +4629,16 @@ class PipelinePage(ttk.Frame):
         self.is_running = False
         self.btn_execute.config(state=tk.NORMAL)
         self.btn_cancel.config(state=tk.DISABLED)
+        self.btn_validar.config(state=tk.NORMAL)
+        self.btn_change_dir.config(state=tk.NORMAL)
+        try:
+            self.btn_pipeline_back.config(state=tk.NORMAL)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self.root.config(cursor="")
+        except tk.TclError:
+            pass
         
         if success:
             self._refresh_last_success_label()
@@ -4435,6 +4667,16 @@ class PipelinePage(ttk.Frame):
         self.is_running = False
         self.btn_execute.config(state=tk.NORMAL)
         self.btn_cancel.config(state=tk.DISABLED)
+        self.btn_validar.config(state=tk.NORMAL)
+        self.btn_change_dir.config(state=tk.NORMAL)
+        try:
+            self.btn_pipeline_back.config(state=tk.NORMAL)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self.root.config(cursor="")
+        except tk.TclError:
+            pass
         
         # Verificar si fue cancelación
         if "Cancelado" in error_msg or self.cancel_event.is_set():
@@ -4602,12 +4844,13 @@ class MercadoPipelinePage(ttk.Frame):
                 font=("Segoe UI", 9),
             ).pack(side=tk.LEFT)
 
-        ttk.Button(
+        self.btn_refresh_diag = ttk.Button(
             diag_card,
             text="↻  Refrescar diagnóstico",
             command=self._refresh_diagnostico,
             style="Secondary.TButton",
-        ).pack(anchor="w", pady=(8, 0))
+        )
+        self.btn_refresh_diag.pack(anchor="w", pady=(8, 0))
 
     def _refresh_diagnostico(self) -> None:
         try:
@@ -4628,11 +4871,13 @@ class MercadoPipelinePage(ttk.Frame):
         header.pack(fill=tk.X)
         ttk.Label(header, text="📊 Estudio de Mercado Colombia", style="Header.TLabel").pack(side=tk.LEFT)
         if self.on_back:
-            ttk.Button(
-                header, text="← Volver al menú",
+            self.btn_mercado_back = ttk.Button(
+                header,
+                text="← Volver al menú",
                 command=lambda: self.on_back() if self.on_back else None,
                 style="Back.TButton",
-            ).pack(side=tk.RIGHT)
+            )
+            self.btn_mercado_back.pack(side=tk.RIGHT)
 
         # ── Canvas + scrollbar vertical ──────────────────────────────────────
         canvas_outer = ttk.Frame(root_frame, style="Page.TFrame")
@@ -4739,7 +4984,10 @@ class MercadoPipelinePage(ttk.Frame):
         vcmd = (self.register(self._validate_digits), "%P")
         self.smlmv_entry = ttk.Entry(entry_row, textvariable=self.smlmv_var, width=12, validate="key", validatecommand=vcmd)
         self.smlmv_entry.pack(side=tk.LEFT, padx=(6, 6))
-        ttk.Button(entry_row, text="Actualizar", command=self._update_smlmv, style="Secondary.TButton").pack(side=tk.LEFT)
+        self.btn_smlmv_update = ttk.Button(
+            entry_row, text="Actualizar", command=self._update_smlmv, style="Secondary.TButton"
+        )
+        self.btn_smlmv_update.pack(side=tk.LEFT)
         ttk.Label(
             smlmv_card,
             text="El valor se usa en la Fase 4 para calcular salarios en SMLMV. Se guarda en config.json y persiste entre sesiones.",
@@ -4754,6 +5002,7 @@ class MercadoPipelinePage(ttk.Frame):
             _bench_available = False
 
         if _bench_available:
+            self._mercado_bench_widgets: list[tk.Misc] = []
             bench_card = ttk.Frame(main_frame, padding=16, style="Card.TFrame")
             bench_card.pack(fill=tk.X, pady=(0, 14))
             ttk.Label(bench_card, text="🏷️ Benchmarks de costo de matrícula por nivel", style="SectionTitle.TLabel").pack(anchor="w")
@@ -4792,14 +5041,20 @@ class MercadoPipelinePage(ttk.Frame):
                 var = tk.StringVar(value=str(int(valor_actual)))
                 self._bench_vars[nivel_key] = var
                 ttk.Entry(fila, textvariable=var, width=13, validate="key", validatecommand=vcmd_bench).pack(side=tk.LEFT)
+                _ent_b = fila.winfo_children()[-1]
+                self._mercado_bench_widgets.append(_ent_b)
 
                 # Capturar nivel_key para el closure
-                ttk.Button(
+                _btn_b = ttk.Button(
                     fila,
                     text="Actualizar",
                     command=lambda nk=nivel_key: self._update_benchmark(nk),
                     style="Secondary.TButton",
-                ).pack(side=tk.LEFT, padx=(6, 0))
+                )
+                _btn_b.pack(side=tk.LEFT, padx=(6, 0))
+                self._mercado_bench_widgets.append(_btn_b)
+        else:
+            self._mercado_bench_widgets = []
 
         # ── Card: Fase 1 — clasificación ─────────────────────────────────────
         fase1_card = ttk.Frame(main_frame, padding=16, style="Card.TFrame")
@@ -4887,11 +5142,12 @@ class MercadoPipelinePage(ttk.Frame):
         )
         self.seg_desc_label.pack(anchor="w", pady=(4, 10))
         self.var_force_recalc = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        self.cb_force_seg = ttk.Checkbutton(
             seg_card,
             text="Forzar recálculo completo (ignorar caché)",
             variable=self.var_force_recalc,
-        ).pack(anchor="w", pady=(0, 6))
+        )
+        self.cb_force_seg.pack(anchor="w", pady=(0, 6))
         btn_frame_seg = ttk.Frame(seg_card, style="Card.TFrame")
         btn_frame_seg.pack(anchor="w")
         self.btn_segmentos = ttk.Button(
@@ -4972,13 +5228,78 @@ class MercadoPipelinePage(ttk.Frame):
         self.messages_text.pack(fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.messages_text.yview)
 
+        self._mercado_init_busy_helpers()
+
+    def _mercado_init_busy_helpers(self) -> None:
+        if not getattr(self, "_mercado_bench_widgets", None):
+            self._mercado_bench_widgets = []
+        self._mercado_secondary_widgets = [
+            w
+            for w in (
+                getattr(self, "btn_mercado_back", None),
+                getattr(self, "btn_refresh_diag", None),
+                self.cb_base,
+                self.cb_sabana,
+                self.smlmv_entry,
+                getattr(self, "btn_smlmv_update", None),
+                self.btn_fase1,
+                self.btn_ver_programas,
+                self.btn_execute,
+                self.btn_resultado,
+                self.btn_segmentos,
+                getattr(self, "cb_force_seg", None),
+                self.btn_valorizacion,
+                self.btn_ver_valorizacion,
+            )
+            if w is not None
+        ]
+        self._mercado_bench_busy = list(self._mercado_bench_widgets)
+
+    def _mercado_refresh_resultado_button_state(self) -> None:
+        try:
+            from etl.config import ARCHIVO_ESTUDIO_MERCADO
+
+            self.btn_resultado.config(
+                state=tk.NORMAL if ARCHIVO_ESTUDIO_MERCADO.exists() else tk.DISABLED
+            )
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _mercado_set_secondary_busy(self, busy: bool) -> None:
+        """Deshabilita controles secundarios (y benchmarks) durante hilos largos; no toca los botones Cancelar."""
+        st = tk.DISABLED if busy else tk.NORMAL
+        for w in getattr(self, "_mercado_secondary_widgets", ()):
+            try:
+                w.config(state=st)
+            except (tk.TclError, AttributeError):
+                pass
+        for w in getattr(self, "_mercado_bench_busy", ()):
+            try:
+                w.config(state=st)
+            except (tk.TclError, AttributeError):
+                pass
+        try:
+            self.root.config(cursor="watch" if busy else "")
+        except (tk.TclError, AttributeError):
+            pass
+        if not busy:
+            self._check_checkpoints(quiet=True)
+            self._mercado_refresh_resultado_button_state()
+
     def _on_valorizacion_clicked(self):
         """Ejecuta la Fase 7 — Valorización de Programas."""
         import threading
         from etl.valorizacion_pipeline import run_fase_valorizacion
 
-        self.btn_valorizacion.config(state=tk.DISABLED)
-        self.btn_ver_valorizacion.config(state=tk.DISABLED)
+        if self.is_running:
+            messagebox.showwarning(
+                "Atención",
+                "Hay un proceso del estudio de mercado en curso. Espera a que termine o cancélalo.",
+                parent=self.root,
+            )
+            return
+
+        self._mercado_set_secondary_busy(True)
         self.prog_val.start(12)
         self.lbl_val_status.config(text="⏳ Generando valorización...")
         self._log_message("━━━ Fase 7 — Valorización de Programas ━━━")
@@ -4994,6 +5315,7 @@ class MercadoPipelinePage(ttk.Frame):
 
     def _on_valorizacion_done(self, ruta: Path):
         self.prog_val.stop()
+        self._mercado_set_secondary_busy(False)
         self.btn_valorizacion.config(state=tk.NORMAL)
         self.btn_ver_valorizacion.config(state=tk.NORMAL)
         self._val_ruta = ruta
@@ -5002,7 +5324,9 @@ class MercadoPipelinePage(ttk.Frame):
 
     def _on_valorizacion_error(self, exc: Exception):
         self.prog_val.stop()
+        self._mercado_set_secondary_busy(False)
         self.btn_valorizacion.config(state=tk.NORMAL)
+        self.btn_ver_valorizacion.config(state=tk.DISABLED)
         self.lbl_val_status.config(text=f"❌ Error: {exc}")
         self._log_message(f"✗ Error en valorización: {exc}")
         messagebox.showerror(
@@ -5204,7 +5528,7 @@ class MercadoPipelinePage(ttk.Frame):
             return
 
         self.seg_cancel_event.clear()
-        self.btn_segmentos.config(state=tk.DISABLED)
+        self._mercado_set_secondary_busy(True)
         self.btn_cancel_seg.config(state=tk.NORMAL)
         self.prog_seg.start(12)
         self._log_message("Iniciando generación de reportes segmentados...")
@@ -5245,6 +5569,7 @@ class MercadoPipelinePage(ttk.Frame):
 
     def _on_segmentos_completed(self, resultados: dict) -> None:
         self.prog_seg.stop()
+        self._mercado_set_secondary_busy(False)
         self.btn_segmentos.config(state=tk.NORMAL)
         self.btn_cancel_seg.config(state=tk.DISABLED)
         nombres = ", ".join(resultados.keys()) if resultados else "ninguno"
@@ -5261,31 +5586,36 @@ class MercadoPipelinePage(ttk.Frame):
 
     def _on_segmentos_error(self, error: str) -> None:
         self.prog_seg.stop()
+        self._mercado_set_secondary_busy(False)
         self.btn_segmentos.config(state=tk.NORMAL)
         self.btn_cancel_seg.config(state=tk.DISABLED)
         self._log_message(f"Error en segmentos: {error}")
         messagebox.showerror("Error en segmentos", error, parent=self.root)
 
-    def _check_checkpoints(self):
+    def _check_checkpoints(self, quiet: bool = False):
         from etl.config import CHECKPOINT_BASE_MAESTRA
         sabana_path = CHECKPOINT_BASE_MAESTRA.parent / "sabana_consolidada.parquet"
         if CHECKPOINT_BASE_MAESTRA.exists():
             self.cb_base.config(state=tk.NORMAL)
             self.reuse_base_var.set(True)
-            self._log_message("✓ Checkpoint base_maestra encontrado")
+            if not quiet:
+                self._log_message("✓ Checkpoint base_maestra encontrado")
         if sabana_path.exists():
             self.cb_sabana.config(state=tk.NORMAL)
             self.reuse_sabana_var.set(True)
-            self._log_message("✓ Checkpoint sabana_consolidada encontrado")
+            if not quiet:
+                self._log_message("✓ Checkpoint sabana_consolidada encontrado")
         if not CHECKPOINT_BASE_MAESTRA.exists() and not sabana_path.exists():
-            self._log_message("Sin checkpoints. Se ejecutarán todas las fases.")
+            if not quiet:
+                self._log_message("Sin checkpoints. Se ejecutarán todas las fases.")
         # Mostrar el SMLMV efectivo que se usará en el scoring
-        try:
-            smlmv = get_smlmv_sesion()
-            formatted = f"{smlmv:,.0f}".replace(",", ".")
-            self._log_message(f"💰 SMLMV vigente: ${formatted}. Puedes ajustarlo antes de ejecutar.")
-        except Exception:
-            pass
+        if not quiet:
+            try:
+                smlmv = get_smlmv_sesion()
+                formatted = f"{smlmv:,.0f}".replace(",", ".")
+                self._log_message(f"💰 SMLMV vigente: ${formatted}. Puedes ajustarlo antes de ejecutar.")
+            except Exception:
+                pass
         self.root.after(200, self._refresh_checkpoint_label)
 
     def _validate_digits(self, value: str) -> bool:
@@ -5434,11 +5764,9 @@ class MercadoPipelinePage(ttk.Frame):
             pass
 
         self.is_running = True
-        self.btn_fase1.config(state=tk.DISABLED)
         self.cancel_event.clear()
-        self.btn_execute.config(state=tk.DISABLED)
+        self._mercado_set_secondary_busy(True)
         self.btn_cancel.config(state=tk.NORMAL)
-        self.btn_resultado.config(state=tk.DISABLED)
         self.progress.config(value=0)
         self.progress_label.config(text="Progreso: listo", foreground=EAFIT["text_muted"])
         self.messages_text.config(state=tk.NORMAL)
@@ -5456,10 +5784,11 @@ class MercadoPipelinePage(ttk.Frame):
             self.progress.stop()
         except Exception:
             pass
-        self.btn_execute.config(state=tk.NORMAL)
-        self.btn_fase1.config(state=tk.NORMAL)
         self.btn_cancel.config(state=tk.DISABLED)
         self.is_running = False
+        self._mercado_set_secondary_busy(False)
+        self.btn_execute.config(state=tk.NORMAL)
+        self.btn_fase1.config(state=tk.NORMAL)
         self._refresh_checkpoint_label()
 
     def _run_thread(self):
@@ -5586,9 +5915,8 @@ class MercadoPipelinePage(ttk.Frame):
     def _execute_fase1(self):
         self.is_running = True
         self.cancel_event.clear()
-        self.btn_fase1.config(state=tk.DISABLED)
+        self._mercado_set_secondary_busy(True)
         self.btn_cancel_fase1.config(state=tk.NORMAL)
-        self.btn_execute.config(state=tk.DISABLED)
         self.lbl_checkpoint.config(text="Ejecutando Fase 1...", foreground=EAFIT["text_muted"])
         self.progress_fase1.start(12)
         self.progress_label_fase1.config(text="Ejecutando...", foreground=EAFIT["text_muted"])
@@ -5671,8 +5999,9 @@ class MercadoPipelinePage(ttk.Frame):
         except Exception:
             pass
         self.is_running = False
-        self.btn_fase1.config(state=tk.NORMAL)
         self.btn_cancel_fase1.config(state=tk.DISABLED)
+        self._mercado_set_secondary_busy(False)
+        self.btn_fase1.config(state=tk.NORMAL)
         self.btn_execute.config(state=tk.NORMAL)
         self.progress_label_fase1.config(text="")
 

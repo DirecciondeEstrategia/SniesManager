@@ -1147,6 +1147,166 @@ def clasificar_programas_nuevos(
         )
     # ── FIN BACKFILL ──────────────────────────────────────────────────────────
 
+    # ── AUTO-CATÁLOGO: registrar programas EAFIT nuevos que no están en el catálogo ──
+    # Si el SNIES registra un programa de institución EAFIT (1712) que no existe en
+    # catalogoOfertasEAFIT.csv, se añade automáticamente y se excluye del ML classifier.
+    # Lógica: el clasificador ML evalúa competidores externos. Un programa propio de
+    # EAFIT nunca debe clasificarse como referente de sí mismo vía ML.
+    _CODIGO_EAFIT_INST = 1712
+    _NIVEL_MAP = {
+        "UNIVERSITARIO":                       "Universitario",
+        "MAESTRÍA":                            "Maestría",
+        "ESPECIALIZACIÓN":                     "Especialización universitaria",
+        "ESPECIALIZACIÓN MÉDICO QUIRÚRGICA":   "Especialización universitaria",
+        "ESPECIALIZACIÓN TECNOLÓGICA":         "Especialización universitaria",
+        "ESPECIALIZACIÓN TÉCNICO PROFESIONAL": "Especialización universitaria",
+        "DOCTORADO":                           "Doctorado",
+        "TECNOLÓGICO":                         "Tecnológico",
+        "FORMACIÓN TÉCNICA PROFESIONAL":       "Formación Técnica Profesional",
+    }
+
+    # Identificar posibles rutas del catálogo
+    _cat_candidatos = [
+        REF_DIR / "catalogoOfertasEAFIT.csv",
+        REF_DIR / "backup" / "catalogoOfertasEAFIT.csv",
+    ]
+    _ruta_catalogo = next((p for p in _cat_candidatos if p.exists()), None)
+
+    # Separar los nuevos programas de EAFIT del resto de nuevos
+    _mask_nuevos_eafit = (
+        df_nuevos.get("CÓDIGO_INSTITUCIÓN", pd.Series(dtype=str))
+        .astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(_CODIGO_EAFIT_INST)
+    ) | (
+        df_nuevos.get("CÓDIGO_INSTITUCIÓN_PADRE", pd.Series(dtype=str))
+        .astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(_CODIGO_EAFIT_INST)
+    )
+    df_nuevos_eafit = df_nuevos[_mask_nuevos_eafit].copy()
+    # Excluir los programas EAFIT del proceso de clasificación ML
+    df_nuevos = df_nuevos[~_mask_nuevos_eafit].copy()
+
+    if len(df_nuevos_eafit) > 0 and _ruta_catalogo is not None:
+        try:
+            _cat = pd.read_csv(_ruta_catalogo, dtype=str)
+
+            # Normalizar la columna clave del catálogo para comparación
+            _codigos_en_catalogo = set(
+                _cat["Codigo EAFIT"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            )
+
+            # Normalizar código SNIES de los programas EAFIT nuevos
+            _snies_eafit_nuevos = (
+                df_nuevos_eafit["CÓDIGO_SNIES_DEL_PROGRAMA"]
+                .astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            )
+
+            # Filtrar solo los que NO están en el catálogo
+            _mask_no_en_cat = ~_snies_eafit_nuevos.isin(_codigos_en_catalogo)
+            _df_a_agregar = df_nuevos_eafit[_mask_no_en_cat].copy()
+
+            if len(_df_a_agregar) > 0:
+                # Construir filas para el catálogo
+                _filas_nuevas = []
+                for _, _row in _df_a_agregar.iterrows():
+                    _snies = str(_row.get("CÓDIGO_SNIES_DEL_PROGRAMA", "")).strip().replace(".0", "")
+                    _nombre_raw = str(_row.get("NOMBRE_DEL_PROGRAMA", "")).strip()
+                    _nivel_snies = str(_row.get("NIVEL_DE_FORMACIÓN", "")).strip().upper()
+                    _campo = str(_row.get("CINE_F_2013_AC_CAMPO_AMPLIO", "")).strip()
+                    _estado = str(_row.get("ESTADO_PROGRAMA", "activo")).strip().lower()
+
+                    # Normalizar nombre con limpiar_texto (misma función que usa el catálogo)
+                    try:
+                        from etl.normalizacion import limpiar_texto
+                        _nombre_norm = limpiar_texto(_nombre_raw)
+                    except Exception:
+                        import unicodedata, re
+                        _nombre_norm = re.sub(
+                            r"[^a-z0-9\s]", " ",
+                            unicodedata.normalize("NFKD", _nombre_raw.lower())
+                            .encode("ascii", "ignore").decode(),
+                        ).strip()
+
+                    _nivel_cat = _NIVEL_MAP.get(_nivel_snies, "Especialización universitaria")
+
+                    _filas_nuevas.append({
+                        "Codigo EAFIT":          _snies,
+                        "Nombre Programa EAFIT": _nombre_norm,
+                        "ESTADO_PROGRAMA":       _estado,
+                        "CAMPO_AMPLIO":          _campo,
+                        "NIVEL_DE_FORMACIÓN":    _nivel_cat,
+                    })
+
+                # Añadir al catálogo y guardar
+                _df_nuevas_filas = pd.DataFrame(_filas_nuevas)
+                _cat_actualizado = pd.concat([_cat, _df_nuevas_filas], ignore_index=True)
+                _cat_actualizado.to_csv(_ruta_catalogo, index=False, encoding="utf-8-sig")
+
+                _resumen = "\n".join(
+                    f"  [{r['Codigo EAFIT']}] {r['Nombre Programa EAFIT']} ({r['NIVEL_DE_FORMACIÓN']})"
+                    for r in _filas_nuevas
+                )
+                log_info(
+                    f"[Auto-catálogo EAFIT] {len(_filas_nuevas)} programa(s) nuevo(s) "
+                    f"añadido(s) a {_ruta_catalogo.name}:\n{_resumen}"
+                )
+                print(
+                    f"\n[Auto-catálogo EAFIT] {len(_filas_nuevas)} programa(s) EAFIT "
+                    f"nuevo(s) registrado(s) en el catálogo:\n{_resumen}\n"
+                    "  → Revisar y completar manualmente si es necesario."
+                )
+            else:
+                # Los programas EAFIT nuevos ya estaban en el catálogo
+                log_info(
+                    f"[Auto-catálogo EAFIT] {len(df_nuevos_eafit)} programa(s) EAFIT "
+                    "nuevo(s) ya presentes en el catálogo. Sin cambios."
+                )
+
+        except Exception as _e_cat:
+            log_warning(
+                f"[Auto-catálogo EAFIT] No se pudo actualizar el catálogo: {_e_cat}. "
+                "Los programas EAFIT nuevos fueron igualmente excluidos del clasificador ML."
+            )
+
+    elif len(df_nuevos_eafit) > 0 and _ruta_catalogo is None:
+        log_warning(
+            f"[Auto-catálogo EAFIT] {len(df_nuevos_eafit)} programa(s) EAFIT nuevo(s) "
+            "detectado(s), pero no se encontró catalogoOfertasEAFIT.csv en ref/ ni ref/backup/. "
+            "Fueron excluidos del clasificador ML pero no se pudo actualizar el catálogo."
+        )
+
+    # Marcar los EAFIT nuevos directamente como ES_REFERENTE='Sí' en df_programas,
+    # independientemente de si la escritura del catálogo tuvo éxito o no.
+    # Así no entran al ML y quedan correctamente etiquetados como referentes propios.
+    if len(df_nuevos_eafit) > 0:
+        try:
+            from etl.normalizacion import limpiar_texto as _limpiar_texto_eafit
+        except Exception:
+            def _limpiar_texto_eafit(x):
+                return x
+
+        # Asegurar que las columnas de clasificación existan antes de asignar
+        for _c, _default in [
+            ("ES_REFERENTE",          None),
+            ("PROBABILIDAD",          0.0),
+            ("PROGRAMA_EAFIT_CODIGO", None),
+            ("PROGRAMA_EAFIT_NOMBRE", None),
+        ]:
+            if _c not in df_programas.columns:
+                df_programas[_c] = _default
+
+        _idx_eafit = df_nuevos_eafit.index
+        df_programas.loc[_idx_eafit, "ES_REFERENTE"] = "Sí"
+        df_programas.loc[_idx_eafit, "PROBABILIDAD"] = 1.0
+        # PROGRAMA_EAFIT_NOMBRE = su propio nombre normalizado
+        df_programas.loc[_idx_eafit, "PROGRAMA_EAFIT_NOMBRE"] = (
+            df_programas.loc[_idx_eafit, "NOMBRE_DEL_PROGRAMA"]
+            .apply(lambda x: _limpiar_texto_eafit(x) if pd.notna(x) else x)
+        )
+        df_programas.loc[_idx_eafit, "PROGRAMA_EAFIT_CODIGO"] = (
+            df_programas.loc[_idx_eafit, "CÓDIGO_SNIES_DEL_PROGRAMA"]
+            .astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        )
+    # ── FIN AUTO-CATÁLOGO ─────────────────────────────────────────────────────
+
     if len(df_nuevos) == 0:
         info_msg = "No hay programas nuevos para clasificar. Retornando DataFrame completo con todos los programas."
         print(info_msg)

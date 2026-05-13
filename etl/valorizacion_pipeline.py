@@ -245,6 +245,9 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
         "programas_inactivos": 0,
         "costo_promedio": np.nan,
         "pct_con_matricula": 0.0,
+        # Campos adicionales para scoring correcto en _score_y_calificacion
+        "score_participacion": 1,        # pre-calculado sobre 288 cats; 1-fila colapsa a score 1
+        "NIVEL_MAYORIT": "ESPECIALIZACIÓN",  # necesario para árbol de decisión AAGR ESP vs MAE
     }
 
     if ag is None or len(ag) == 0:
@@ -296,6 +299,19 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
             "programas_inactivos": _get("programas_inactivos", 0.0),
             "costo_promedio": _get("costo_promedio"),
             "pct_con_matricula": _get("pct_con_matricula", 0.0),
+            # ── Campos para scoring contextual (no recomputables en 1 fila) ──
+            # score_participacion: pre-calculado por apply_scoring() sobre el ag completo
+            # (288 cats Colombia o referentes). Pasarlo evita el colapso de quintiles
+            # que ocurre cuando _score_y_calificacion() llama apply_scoring() con 1 fila.
+            "score_participacion": int(_get("score_participacion", 1)),
+            # NIVEL_MAYORIT: nivel dominante de la categoría en el ag (ESP / MAE / UNIVERSITARIO).
+            # Necesario para el árbol de decisión AAGR en apply_scoring() (scoring.py).
+            # _get() solo maneja float; leer string directamente del row.
+            "NIVEL_MAYORIT": (
+                str(row["NIVEL_MAYORIT"]).strip()
+                if "NIVEL_MAYORIT" in row.index and pd.notna(row["NIVEL_MAYORIT"])
+                else "ESPECIALIZACIÓN"
+            ),
         }
         resultados.append(met)
 
@@ -314,7 +330,16 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
             )
             prom[k] = cid
             continue
+        # NIVEL_MAYORIT: tomar el nivel más frecuente (moda) entre las categorías
+        if k == "NIVEL_MAYORIT":
+            niveles = [m[k] for m in resultados if m.get(k)]
+            prom[k] = max(set(niveles), key=niveles.count) if niveles else "ESPECIALIZACIÓN"
+            continue
+        # score_participacion: redondear el promedio (es entero 1-5)
         vals = [m[k] for m in resultados if pd.notna(m.get(k))]
+        if k == "score_participacion":
+            prom[k] = int(round(float(np.mean(vals)))) if vals else 1
+            continue
         prom[k] = float(np.mean(vals)) if vals else np.nan
     return prom
 
@@ -456,6 +481,7 @@ def _score_y_calificacion(metricas: dict) -> dict:
                 "prom_matricula_por_programa_2024": _pmp_scoring,
                 "prom_matricula_2024": _pmp_scoring,
                 "participacion_2024": metricas.get("participacion_2024", 0),
+                "NIVEL_MAYORIT": metricas.get("NIVEL_MAYORIT", "ESPECIALIZACIÓN"),
                 "AAGR_ROBUSTO": metricas.get("AAGR_ROBUSTO", np.nan),
                 "salario_promedio_smlmv": metricas.get("salario_promedio_smlmv", np.nan),
                 "pct_no_matriculados_2024": metricas.get("pct_no_matriculados_2024", np.nan),
@@ -468,14 +494,17 @@ def _score_y_calificacion(metricas: dict) -> dict:
     row = df_scored.iloc[0]
     return {
         **metricas,
-        "score_matricula": row.get("score_matricula", 1),
-        "score_participacion": row.get("score_participacion", 1),
-        "score_AAGR": row.get("score_AAGR", 1),
-        "score_salario": row.get("score_salario", 1),
+        "score_matricula":          row.get("score_matricula", 1),
+        # Usar score_participacion pre-calculado del parquet (no el de apply_scoring con 1 fila).
+        # apply_scoring con 1 fila siempre produce score 1 por colapso de quintiles dinámicos.
+        "score_participacion":      metricas.get("score_participacion", row.get("score_participacion", 1)),
+        # score_AAGR: ahora aplica árbol ESP/MAE porque NIVEL_MAYORIT está en df_tmp
+        "score_AAGR":               row.get("score_AAGR", 1),
+        "score_salario":            row.get("score_salario", 1),
         "score_pct_no_matriculados": row.get("score_pct_no_matriculados", 1),
-        "score_num_programas": row.get("score_num_programas", 1),
-        "score_costo": row.get("score_costo", 1),
-        "calificacion_final": row.get("calificacion_final", 1.0),
+        "score_num_programas":      row.get("score_num_programas", 1),
+        "score_costo":              row.get("score_costo", 1),
+        "calificacion_final":       row.get("calificacion_final", 1.0),
     }
 
 
@@ -683,18 +712,19 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
             met_r = _lookup_categoria(ag_ref_nacional, categorias)
             met_r_s = _score_y_calificacion(met_r)
 
+            # CAL_INTEGRADA = 0.4 × M + 0.6 × R
+            # Peso 40% mercado general (demanda amplia) + 60% referentes nacionales
+            # (benchmarks de calidad del mismo segmento que EAFIT).
+            # Fórmula aritmética ponderada — más interpretable que la geométrica anterior.
+            _m_cal = met_m_s.get("calificacion_final")
+            _r_cal = met_r_s.get("calificacion_final")
             cal_integrada = (
-                float(
-                    np.sqrt(
-                        met_m_s.get("calificacion_final", 0)
-                        * met_r_s.get("calificacion_final", 0)
-                    )
-                )
+                round(float(0.4 * _m_cal + 0.6 * _r_cal), 4)
                 if (
-                    pd.notna(met_m_s.get("calificacion_final"))
-                    and pd.notna(met_r_s.get("calificacion_final"))
-                    and met_m_s.get("calificacion_final", 0) > 0
-                    and met_r_s.get("calificacion_final", 0) > 0
+                    pd.notna(_m_cal)
+                    and pd.notna(_r_cal)
+                    and _m_cal > 0
+                    and _r_cal > 0
                 )
                 else np.nan
             )
@@ -750,8 +780,7 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                     "R_score_costo": met_r_s["score_costo"],
                     "R_calificacion": met_r_s["calificacion_final"],
                     # ── CALIFICACIÓN INTEGRADA ────────────────────────────────
-                    # Media geométrica de mercado y referentes (√(M × R))
-                    # Replica el Índice de Oportunidad de Portafolio del manual
+                    # 40% calificación mercado regional + 60% calificación referentes nacionales
                     "CAL_INTEGRADA": cal_integrada,
                     # ── VIABILIDAD_ESTUDIO — derivada de CAL_INTEGRADA ──────
                     "VIABILIDAD_ESTUDIO": (
@@ -908,7 +937,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "R_costo_promedio": "Costo Promedio",
         "R_score_costo": "Score",
         "R_calificacion": "CALIFICACIÓN",
-        "CAL_INTEGRADA": "CAL. INTEGRADA √(M×R)",
+        "CAL_INTEGRADA": "CAL. INTEGRADA (40%M + 60%R)",
         "VIABILIDAD_ESTUDIO": "Viabilidad Estudio",
         "PROYECCION_ANUAL": "Proyección Anual (estudiantes)",
         "ANO_LANZAMIENTO": "Año Lanzamiento",
