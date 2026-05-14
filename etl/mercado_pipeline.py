@@ -26,6 +26,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
 from etl.config import (
+    AÑO_FIN_DATOS,
+    AÑO_INICIO_HISTORICO,
+    AÑO_INICIO_PRIMER_CURSO,
     ARCHIVO_PROGRAMAS,
     ARCHIVO_CATALOGO_EAFIT,
     ARCHIVO_REFERENTE_CATEGORIAS,
@@ -155,7 +158,7 @@ def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
     (misma lógica que _normalizar_codigo_snies).
     Retorna Series vacía si el archivo no existe o hay error.
 
-    Cobertura soportada: 2014–2024 (ref/backup/matriculas primer curso/).
+    Cobertura soportada: AÑO_INICIO_PRIMER_CURSO..AÑO_FIN_DATOS (ref/backup/matriculas primer curso/).
     Nombre esperado: `primer_curso_{year}.xlsx`.
     El layout exacto del header se detecta dinámicamente buscando la fila
     que contenga 'CODIGO' + 'SNIES' (header=5 sigue siendo la primera apuesta
@@ -419,7 +422,7 @@ def run_fase1() -> pd.DataFrame:
     Returns:
         DataFrame con todas las columnas de Programas + CATEGORIA_FINAL +
         FUENTE_CATEGORIA + TASA_COTIZANTES + SALARIO_OLE + INSCRITOS_2023 + INSCRITOS_2024
-        + PRIMER_CURSO_2014..PRIMER_CURSO_2024 (desde ref/backup/matriculas primer curso/).
+        + PRIMER_CURSO_{AÑO_INICIO_PRIMER_CURSO}..PRIMER_CURSO_{AÑO_FIN_DATOS} (desde ref/backup/matriculas primer curso/).
     """
     log_etapa_iniciada("Fase 1: Base maestra con categorías (ML)")
 
@@ -490,8 +493,8 @@ def run_fase1() -> pd.DataFrame:
         "CATEGORIA_FINAL",
         "TASA_COTIZANTES",
         "SALARIO_OLE",
-        "INSCRITOS_2023",
-        "INSCRITOS_2024",
+        f"INSCRITOS_{AÑO_FIN_DATOS - 1}",
+        f"INSCRITOS_{AÑO_FIN_DATOS}",
     ]
     columnas_traer = [c for c in columnas_extra_ref if c in df_referente.columns]
     ref_merge = df_referente[["_snies_norm"] + columnas_traer].copy()
@@ -757,7 +760,7 @@ def run_fase1() -> pd.DataFrame:
         df_base.loc[mask_cruce_snies, "PROBABILIDAD"] = 1.0
         df_base.loc[mask_cruce_snies, "REQUIERE_REVISION"] = False
 
-    # ── Primer curso 2014–2024 ────────────────────────────────────────────────
+    # ── Primer curso AÑO_INICIO_PRIMER_CURSO..AÑO_FIN_DATOS ──────────────────
     # Fuente: ref/backup/matriculas primer curso/primer_curso_{year}.xlsx.
     # Agrega S1+S2 por CÓDIGO_SNIES_DEL_PROGRAMA mediante _leer_primer_curso_anual,
     # que detecta el header dinámicamente y tolera el archivo 2015 sin guión bajo.
@@ -765,7 +768,7 @@ def run_fase1() -> pd.DataFrame:
     # Si un archivo no existe se loggea warning y la columna queda con NaN.
     _SNIES_COL = "CÓDIGO_SNIES_DEL_PROGRAMA"
     _snies_norm_base = _normalizar_codigo_snies(df_base[_SNIES_COL])
-    for _pc_year in range(2014, 2025):
+    for _pc_year in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
         _col_out = f"PRIMER_CURSO_{_pc_year}"
         if _col_out in df_base.columns:
             df_base.drop(columns=[_col_out], inplace=True)
@@ -832,12 +835,12 @@ def validar_archivos_entrada() -> tuple[bool, list[str]]:
     else:
         años_encontrados: list[int] = []
         for f in matriculas_dir.glob("*.xlsx"):
-            for año in range(2019, 2026):
+            for año in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 2):
                 if str(año) in f.name:
                     años_encontrados.append(año)
                     break
         años_encontrados = sorted(set(años_encontrados))
-        años_esperados = list(range(2019, 2025))
+        años_esperados = list(range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1))
         años_faltantes = [a for a in años_esperados if a not in años_encontrados]
         if not años_encontrados:
             errores.append(
@@ -892,7 +895,7 @@ def run_fase2() -> None:
     any_ole = False
 
     # Scraper A: matrículas por semestre + inscritos anual (S1+S2) + primer_curso/graduados por semestre
-    for year in range(2019, 2025):
+    for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         try:
             df_ins = scraper_mat.download_inscritos(year)
             if df_ins is not None and len(df_ins) > 0:
@@ -1077,12 +1080,12 @@ def run_fase3() -> None:
 
     # Guard idempotencia: eliminar columnas previas que serán recalculadas (evita mezclar ejecuciones)
     cols_to_refresh = (
-        [f"matricula_{y}" for y in range(2019, 2025)]
-        + [f"matricula_{y}_1" for y in range(2019, 2025)]
-        + [f"matricula_{y}_2" for y in range(2019, 2025)]
-        + [f"inscritos_{y}" for y in range(2019, 2025)]
-        + [f"primer_curso_{y}" for y in range(2019, 2025)]
-        + [f"graduados_{y}" for y in range(2019, 2025)]
+        [f"matricula_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [f"matricula_{y}_1" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [f"matricula_{y}_2" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [f"inscritos_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [f"primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [f"graduados_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
     )
     cols_existentes = [c for c in cols_to_refresh if c in base.columns]
     if cols_existentes:
@@ -1096,13 +1099,13 @@ def run_fase3() -> None:
     base["_codigo_norm"] = _normalizar_codigo_snies(base[codigo_col])
 
     # 3.1 Matrículas e inscritos históricos (2019-2024, semestre 1+2)
-    matricula_cols = [f"matricula_{y}" for y in range(2019, 2025)]
-    sem_cols = [f"matricula_{y}_{s}" for y in range(2019, 2025) for s in (1, 2)]
-    inscritos_cols = [f"inscritos_{y}" for y in range(2019, 2025)]
-    primer_curso_cols = [f"primer_curso_{y}" for y in range(2019, 2025)]
-    graduados_cols = [f"graduados_{y}" for y in range(2019, 2025)]
+    matricula_cols = [f"matricula_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+    sem_cols = [f"matricula_{y}_{s}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1) for s in (1, 2)]
+    inscritos_cols = [f"inscritos_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+    primer_curso_cols = [f"primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+    graduados_cols = [f"graduados_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
 
-    for year in range(2019, 2025):
+    for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         m1 = _cargar_csv_raw(raw_dir, f"matriculados_{year}_1.csv")
         m2 = _cargar_csv_raw(raw_dir, f"matriculados_{year}_2.csv")
         if codigo_col in m1.columns:
@@ -1201,7 +1204,7 @@ def run_fase3() -> None:
             )
 
     # 3.2b Primer curso por año y semestre (2019-2024)
-    for year in range(2019, 2025):
+    for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         pc1 = _cargar_csv_raw(raw_dir, f"primer_curso_{year}_1.csv")
         pc2 = _cargar_csv_raw(raw_dir, f"primer_curso_{year}_2.csv")
         for df_pc in (pc1, pc2):
@@ -1231,7 +1234,7 @@ def run_fase3() -> None:
         base = base.merge(merge_pc[["_codigo_norm", col_pc]], on="_codigo_norm", how="left")
 
     # 3.2c Graduados por año y semestre (2019-2024)
-    for year in range(2019, 2025):
+    for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         g1 = _cargar_csv_raw(raw_dir, f"graduados_{year}_1.csv")
         g2 = _cargar_csv_raw(raw_dir, f"graduados_{year}_2.csv")
         for df_g in (g1, g2):
@@ -1322,7 +1325,7 @@ def run_fase3() -> None:
             base[col] = base[col].fillna(0)
 
     # Cobertura de inscritos (fuente primaria: SNIES por código; los CSVs vienen de Fase 2)
-    for year in (2019, 2020, 2021, 2022, 2023, 2024):
+    for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         col_ins = f"inscritos_{year}"
         if col_ins in base.columns:
             n_con_datos = int((base[col_ins] > 0).sum())
@@ -1330,10 +1333,10 @@ def run_fase3() -> None:
             pct = (n_con_datos / n_total) if n_total else 0
             log_info(f"[Fase 3] {col_ins}: {n_con_datos:,} programas con dato real de {n_total:,} ({pct:.0%})")
 
-    # Cobertura de primer curso y graduados
+    # Cobertura de primer curso y graduados (últimos 2 años)
     for col in (
-        [f"primer_curso_{y}" for y in (2023, 2024)]
-        + [f"graduados_{y}" for y in (2022, 2023)]
+        [f"primer_curso_{y}" for y in (AÑO_FIN_DATOS - 1, AÑO_FIN_DATOS)]
+        + [f"graduados_{y}" for y in (AÑO_FIN_DATOS - 2, AÑO_FIN_DATOS - 1)]
     ):
         if col in base.columns:
             n_con_datos = int((base[col] > 0).sum())
@@ -1453,7 +1456,7 @@ def run_fase3() -> None:
     # 3.4 Columnas derivadas
     # Regla de negocio: ACTIVO = (matricula_último_año > 0) OR (ESTADO_PROGRAMA == 'activo')
     # Corrige programas marcados "inactivo" pero con matrícula real.
-    ultimo_y = next((y for y in range(2025, 2018, -1) if f"matricula_{y}" in base.columns), None)
+    ultimo_y = next((y for y in range(AÑO_FIN_DATOS + 1, AÑO_INICIO_HISTORICO - 1, -1) if f"matricula_{y}" in base.columns), None)
     mat_ultimo = base.get(f"matricula_{ultimo_y}", pd.Series(0, index=base.index)).fillna(0) if ultimo_y else pd.Series(0, index=base.index)
     estado_activo = (
         base["ESTADO_PROGRAMA"].astype(str).str.strip().str.lower() == "activo"
@@ -1470,12 +1473,15 @@ def run_fase3() -> None:
     except Exception:
         pass
     # nuevo_por_primera_matricula: programa que entró al mercado recientemente.
-    # Criterio: sin actividad en el año base (2019) pero con matrícula en alguno de
-    # los últimos 3 años disponibles (2022, 2023, 2024).
+    # Criterio: sin actividad en el año base (AÑO_INICIO_HISTORICO) pero con matrícula en
+    # alguno de los últimos 3 años disponibles.
     # Más robusto que FECHA_DE_REGISTRO_EN_SNIES, que incluye programas sin actividad real.
     try:
-        _mat_base = base.get("matricula_2019", pd.Series(0, index=base.index)).fillna(0)
-        _años_recientes = [y for y in [2022, 2023, 2024] if f"matricula_{y}" in base.columns]
+        _mat_base = base.get(f"matricula_{AÑO_INICIO_HISTORICO}", pd.Series(0, index=base.index)).fillna(0)
+        _años_recientes = [
+            y for y in range(AÑO_FIN_DATOS - 2, AÑO_FIN_DATOS + 1)
+            if f"matricula_{y}" in base.columns
+        ]
         if _años_recientes:
             _mat_reciente = base[[f"matricula_{y}" for y in _años_recientes]].fillna(0).max(axis=1)
             base["nuevo_en_snies_3a"] = (_mat_base == 0) & (_mat_reciente > 0)
@@ -1492,15 +1498,16 @@ def run_fase3() -> None:
         log_warning(f"[Fase 3] no se pudo calcular nuevo_en_snies_3a: {_e}")
         base["nuevo_en_snies_3a"] = False
     base["nuevo_en_snies_3a"] = base["nuevo_en_snies_3a"].fillna(False)
-    mat_2024 = base.get("matricula_2024", pd.Series(0, index=base.index)).fillna(0)
-    base["tiene_matricula_2024"] = (mat_2024 > 0).astype(bool)
+    _col_mat_fin = f"matricula_{AÑO_FIN_DATOS}"
+    mat_fin = base.get(_col_mat_fin, pd.Series(0, index=base.index)).fillna(0)
+    base[f"tiene_matricula_{AÑO_FIN_DATOS}"] = (mat_fin > 0).astype(bool)
 
     base = base.drop(columns=["_codigo_norm"], errors="ignore")
 
     # Validación post-merge: matrículas anuales y semestrales
     n_total = len(base)
     log_info("[Fase 3] === VALIDACIÓN DE MATRÍCULAS ===")
-    for year in range(2019, 2025):
+    for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         col = f"matricula_{year}"
         if col in base.columns:
             nonzero = int((base[col].fillna(0) > 0).sum())
@@ -1517,7 +1524,7 @@ def run_fase3() -> None:
             log_info(f"[Fase 3]   sem1={nz1:,}  sem2={nz2:,}")
 
     # Alerta: si la mayoría de programas tiene matrícula en 0 (falla masiva)
-    for col in ["matricula_2022", "matricula_2023", "matricula_2024"]:
+    for col in [f"matricula_{y}" for y in range(AÑO_FIN_DATOS - 2, AÑO_FIN_DATOS + 1)]:
         if col not in base.columns or n_total == 0:
             continue
         con_dato = (base[col].fillna(0) > 0).sum()
@@ -1534,7 +1541,7 @@ def run_fase3() -> None:
     base["schema_version"] = SCHEMA_VERSION
     base.to_parquet(sabana_path, index=False)
     n = len(base)
-    pct_mat24 = (base["tiene_matricula_2024"].sum() / n * 100) if n else 0
+    pct_mat24 = (base[f"tiene_matricula_{AÑO_FIN_DATOS}"].sum() / n * 100) if n else 0
     ole_reales = (base["FUENTE_OLE"].isin(["REFERENTE", "SCRAPER", "BACKUP"])).sum()
     pct_ole = (ole_reales / n * 100) if n else 0
     tiene_costo = base[costo_col].notna().sum()
@@ -1604,7 +1611,7 @@ def run_fase4_desde_sabana(
             f"[Fase 4 / {universo}] Columna NIVEL_DE_FORMACIÓN no encontrada — procesando todos."
         )
 
-    years = list(range(2019, 2025))
+    years = list(range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1))
     grouped = df.groupby("CATEGORIA_FINAL", as_index=True)
 
     def _count_false(s: pd.Series) -> int:
@@ -1621,19 +1628,19 @@ def run_fase4_desde_sabana(
             c_sem = f"matricula_{y}_{s}"
             if c_sem in df.columns:
                 simple_agg[f"suma_matricula_{y}_{s}"] = pd.NamedAgg(column=c_sem, aggfunc="sum")
-    for y in [2023, 2024]:
+    for y in (AÑO_FIN_DATOS - 1, AÑO_FIN_DATOS):
         c = f"inscritos_{y}"
         if c in df.columns:
             simple_agg[f"inscritos_{y}_suma"] = pd.NamedAgg(column=c, aggfunc="sum")
             simple_agg[f"inscritos_{y}_prom"] = pd.NamedAgg(column=c, aggfunc="mean")
 
-    for y in range(2019, 2025):
+    for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         c = f"primer_curso_{y}"
         if c in df.columns:
             simple_agg[f"suma_primer_curso_{y}"] = pd.NamedAgg(column=c, aggfunc="sum")
             simple_agg[f"prom_primer_curso_{y}"] = pd.NamedAgg(column=c, aggfunc="mean")
 
-    for y in range(2019, 2025):
+    for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         c = f"graduados_{y}"
         if c in df.columns:
             simple_agg[f"graduados_{y}_suma"] = pd.NamedAgg(column=c, aggfunc="sum")
@@ -1656,10 +1663,10 @@ def run_fase4_desde_sabana(
         mat_col = f"matricula_{y}"
         if mat_col in df.columns:
             ag[f"num_programas_{y}"] = grouped[mat_col].apply(lambda s: (s > 0).sum())
-    if "num_programas_2019" not in ag.columns:
-        ag["num_programas_2019"] = 0
-    if "num_programas_2024" not in ag.columns:
-        ag["num_programas_2024"] = 0
+    if f"num_programas_{AÑO_INICIO_HISTORICO}" not in ag.columns:
+        ag[f"num_programas_{AÑO_INICIO_HISTORICO}"] = 0
+    if f"num_programas_{AÑO_FIN_DATOS}" not in ag.columns:
+        ag[f"num_programas_{AÑO_FIN_DATOS}"] = 0
 
     ag = ag.reset_index()
 
@@ -1679,7 +1686,7 @@ def run_fase4_desde_sabana(
     else:
         ag["NIVEL_MAYORIT"] = "ESPECIALIZACIÓN"
 
-    for y in range(2020, 2025):
+    for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
         c_curr = f"suma_primer_curso_{y}"
         c_prev = f"suma_primer_curso_{y-1}"
         if c_curr in ag.columns and c_prev in ag.columns:
@@ -1687,22 +1694,22 @@ def run_fase4_desde_sabana(
             ag[f"var_primer_curso_{y}"] = (ag[c_curr] - ag[c_prev]) / den
 
     var_pc_cols = [
-        f"var_primer_curso_{y}" for y in range(2020, 2025) if f"var_primer_curso_{y}" in ag.columns
+        f"var_primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1) if f"var_primer_curso_{y}" in ag.columns
     ]
     if var_pc_cols:
         ag["AAGR_primer_curso"] = ag[var_pc_cols].mean(axis=1)
     else:
         ag["AAGR_primer_curso"] = np.nan
 
-    if "graduados_2023_suma" in ag.columns and "suma_matricula_2022" in ag.columns:
-        den_grad = ag["suma_matricula_2022"].replace(0, np.nan)
-        ag["tasa_graduacion"] = (ag["graduados_2023_suma"] / den_grad).clip(0, 2)
+    if f"graduados_{AÑO_FIN_DATOS - 1}_suma" in ag.columns and f"suma_matricula_{AÑO_FIN_DATOS - 2}" in ag.columns:
+        den_grad = ag[f"suma_matricula_{AÑO_FIN_DATOS - 2}"].replace(0, np.nan)
+        ag["tasa_graduacion"] = (ag[f"graduados_{AÑO_FIN_DATOS - 1}_suma"] / den_grad).clip(0, 2)
 
-    if "suma_primer_curso_2024" in ag.columns:
-        ag["tiene_primer_curso_real"] = ag["suma_primer_curso_2024"] > 0
+    if f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
+        ag["tiene_primer_curso_real"] = ag[f"suma_primer_curso_{AÑO_FIN_DATOS}"] > 0
 
     # var_suma y var_prom (2020-2024)
-    for y in range(2020, 2025):
+    for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
         s_curr = ag.get(f"suma_matricula_{y}", pd.Series(dtype=float))
         s_prev = ag.get(f"suma_matricula_{y-1}", pd.Series(dtype=float))
         if s_curr is not None and s_prev is not None and len(s_prev) == len(ag):
@@ -1715,49 +1722,52 @@ def run_fase4_desde_sabana(
             ag[f"var_prom_{y}"] = (p_curr - p_prev) / den_p
 
     # participacion_2019 — mantiene matrícula total como referencia histórica
-    total_prom_2019 = ag["prom_matricula_2019"].sum() if "prom_matricula_2019" in ag.columns else 0
+    total_prom_2019 = ag[f"prom_matricula_{AÑO_INICIO_HISTORICO}"].sum() if f"prom_matricula_{AÑO_INICIO_HISTORICO}" in ag.columns else 0
     if total_prom_2019 and total_prom_2019 != 0:
-        ag["participacion_2019"] = ag["prom_matricula_2019"] / total_prom_2019
+        ag[f"participacion_{AÑO_INICIO_HISTORICO}"] = ag[f"prom_matricula_{AÑO_INICIO_HISTORICO}"] / total_prom_2019
     else:
-        ag["participacion_2019"] = np.nan
+        ag[f"participacion_{AÑO_INICIO_HISTORICO}"] = np.nan
 
     # participacion_2024 — sobre primer_curso (peso relativo del flujo de nuevos)
-    if "prom_primer_curso_2024" in ag.columns:
-        total_pc_2024 = ag["prom_primer_curso_2024"].sum()
+    if f"prom_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
+        total_pc_2024 = ag[f"prom_primer_curso_{AÑO_FIN_DATOS}"].sum()
         if total_pc_2024 and total_pc_2024 != 0:
-            ag["participacion_2024"] = ag["prom_primer_curso_2024"] / total_pc_2024
+            ag[f"participacion_{AÑO_FIN_DATOS}"] = ag[f"prom_primer_curso_{AÑO_FIN_DATOS}"] / total_pc_2024
         else:
-            ag["participacion_2024"] = np.nan
+            ag[f"participacion_{AÑO_FIN_DATOS}"] = np.nan
     else:
-        total_prom_2024 = ag["prom_matricula_2024"].sum() if "prom_matricula_2024" in ag.columns else 0
-        ag["participacion_2024"] = (
-            ag["prom_matricula_2024"] / total_prom_2024
+        total_prom_2024 = ag[f"prom_matricula_{AÑO_FIN_DATOS}"].sum() if f"prom_matricula_{AÑO_FIN_DATOS}" in ag.columns else 0
+        ag[f"participacion_{AÑO_FIN_DATOS}"] = (
+            ag[f"prom_matricula_{AÑO_FIN_DATOS}"] / total_prom_2024
             if total_prom_2024 != 0 else np.nan
         )
 
     # AAGR_suma y AAGR_prom
-    var_suma_cols = [f"var_suma_{y}" for y in range(2020, 2025) if f"var_suma_{y}" in ag.columns]
-    var_prom_cols = [f"var_prom_{y}" for y in range(2020, 2025) if f"var_prom_{y}" in ag.columns]
+    var_suma_cols = [f"var_suma_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1) if f"var_suma_{y}" in ag.columns]
+    var_prom_cols = [f"var_prom_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1) if f"var_prom_{y}" in ag.columns]
     ag["AAGR_suma"] = ag[var_suma_cols].mean(axis=1) if var_suma_cols else np.nan
     ag["AAGR_prom"] = ag[var_prom_cols].mean(axis=1) if var_prom_cols else np.nan
 
-    # CAGR_suma requiere suma_matricula_2019 y suma_matricula_2024
+    # CAGR_suma requiere suma_matricula del primer y último año del histórico
     ag["CAGR_suma"] = np.nan
-    if "suma_matricula_2019" in ag.columns and "suma_matricula_2024" in ag.columns:
-        suma_2019 = ag["suma_matricula_2019"]
-        suma_2024 = ag["suma_matricula_2024"]
+    _n_years_cagr = max(AÑO_FIN_DATOS - AÑO_INICIO_HISTORICO, 1)
+    if f"suma_matricula_{AÑO_INICIO_HISTORICO}" in ag.columns and f"suma_matricula_{AÑO_FIN_DATOS}" in ag.columns:
+        suma_2019 = ag[f"suma_matricula_{AÑO_INICIO_HISTORICO}"]
+        suma_2024 = ag[f"suma_matricula_{AÑO_FIN_DATOS}"]
         mask_cagr = (suma_2019 > 0) & (suma_2024 > 0)
-        ag.loc[mask_cagr, "CAGR_suma"] = (suma_2024[mask_cagr] / suma_2019[mask_cagr]) ** (1 / 5) - 1
+        ag.loc[mask_cagr, "CAGR_suma"] = (
+            suma_2024[mask_cagr] / suma_2019[mask_cagr]
+        ) ** (1 / _n_years_cagr) - 1
 
     # CAGR_primer_curso — tasa compuesta sobre flujo de nuevos matriculados
     ag["CAGR_primer_curso"] = np.nan
-    if "suma_primer_curso_2019" in ag.columns and "suma_primer_curso_2024" in ag.columns:
-        pc_2019 = ag["suma_primer_curso_2019"]
-        pc_2024 = ag["suma_primer_curso_2024"]
+    if f"suma_primer_curso_{AÑO_INICIO_HISTORICO}" in ag.columns and f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
+        pc_2019 = ag[f"suma_primer_curso_{AÑO_INICIO_HISTORICO}"]
+        pc_2024 = ag[f"suma_primer_curso_{AÑO_FIN_DATOS}"]
         mask_cagr_pc = (pc_2019 > 0) & (pc_2024 > 0)
         ag.loc[mask_cagr_pc, "CAGR_primer_curso"] = (
             pc_2024[mask_cagr_pc] / pc_2019[mask_cagr_pc]
-        ) ** (1 / 5) - 1
+        ) ** (1 / _n_years_cagr) - 1
 
     # AAGR_ROBUSTO — árbol de decisión con UMBRAL_BASE diferenciado por universo.
     # El umbral determina cuándo la base histórica (suma_primer_curso_2019) es suficientemente
@@ -1786,9 +1796,9 @@ def run_fase4_desde_sabana(
         _umbral_series = ag["NIVEL_MAYORIT"].apply(_umbral_base)
     else:
         _umbral_series = pd.Series(30, index=ag.index)  # fallback global
-    if "suma_primer_curso_2019" in ag.columns and "suma_primer_curso_2024" in ag.columns:
-        m19 = ag["suma_primer_curso_2019"].fillna(0)
-        m24 = ag["suma_primer_curso_2024"].fillna(0)
+    if f"suma_primer_curso_{AÑO_INICIO_HISTORICO}" in ag.columns and f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
+        m19 = ag[f"suma_primer_curso_{AÑO_INICIO_HISTORICO}"].fillna(0)
+        m24 = ag[f"suma_primer_curso_{AÑO_FIN_DATOS}"].fillna(0)
 
         cond_normal = m19 >= _umbral_series
         cond_pequena = (m19 > 0) & (m19 < _umbral_series)
@@ -1841,20 +1851,20 @@ def run_fase4_desde_sabana(
     # var_yoy_2024: variación real del último año (2023→2024)
     # diferencial_tendencia: cuánto se desvía el YoY del AAGR histórico
     # SEÑAL_TENDENCIA: etiqueta legible para el analista
-    if "suma_primer_curso_2023" in ag.columns and "suma_primer_curso_2024" in ag.columns:
-        m23 = pd.to_numeric(ag["suma_primer_curso_2023"], errors="coerce").fillna(0)
-        m24 = pd.to_numeric(ag["suma_primer_curso_2024"], errors="coerce").fillna(0)
+    if f"suma_primer_curso_{AÑO_FIN_DATOS - 1}" in ag.columns and f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
+        m23 = pd.to_numeric(ag[f"suma_primer_curso_{AÑO_FIN_DATOS - 1}"], errors="coerce").fillna(0)
+        m24 = pd.to_numeric(ag[f"suma_primer_curso_{AÑO_FIN_DATOS}"], errors="coerce").fillna(0)
         den_yoy = m23.replace(0, np.nan)
-        ag["var_yoy_2024"] = (m24 - m23) / den_yoy
+        ag[f"var_yoy_{AÑO_FIN_DATOS}"] = (m24 - m23) / den_yoy
 
         if "AAGR_ROBUSTO" in ag.columns:
-            ag["diferencial_tendencia"] = ag["var_yoy_2024"] - pd.to_numeric(ag["AAGR_ROBUSTO"], errors="coerce")
+            ag["diferencial_tendencia"] = ag[f"var_yoy_{AÑO_FIN_DATOS}"] - pd.to_numeric(ag["AAGR_ROBUSTO"], errors="coerce")
         else:
             ag["diferencial_tendencia"] = np.nan
 
         # SEÑAL_TENDENCIA: combina YoY y diferencial para una etiqueta accionable
         def _señal(row: pd.Series) -> str:
-            yoy = row.get("var_yoy_2024", np.nan)
+            yoy = row.get(f"var_yoy_{AÑO_FIN_DATOS}", np.nan)
             dif = row.get("diferencial_tendencia", np.nan)
             if pd.isna(yoy):
                 return "SIN_DATO"
@@ -1878,7 +1888,7 @@ def run_fase4_desde_sabana(
             )
         )
     else:
-        ag["var_yoy_2024"] = np.nan
+        ag[f"var_yoy_{AÑO_FIN_DATOS}"] = np.nan
         ag["diferencial_tendencia"] = np.nan
         ag["SEÑAL_TENDENCIA"] = "SIN_DATO"
         log_info("Momentum YoY: no se encontraron columnas suma_primer_curso_2023/2024.")
@@ -1902,83 +1912,82 @@ def run_fase4_desde_sabana(
         return ((ins - pc) / den).clip(lower=0, upper=1)
 
     # pct_no_matriculados_2023
-    ag["pct_no_matriculados_2023"] = _calc_pct_vs_pc(
-        "inscritos_2023_suma", "suma_primer_curso_2023"
+    ag[f"pct_no_matriculados_{AÑO_FIN_DATOS - 1}"] = _calc_pct_vs_pc(
+        f"inscritos_{AÑO_FIN_DATOS - 1}_suma", f"suma_primer_curso_{AÑO_FIN_DATOS - 1}"
     )
 
     # pct_no_matriculados_2024 — prioridad 2024, fallback 2023
-    pct_2024 = _calc_pct_vs_pc("inscritos_2024_suma", "suma_primer_curso_2024")
-    pct_2023 = _calc_pct_vs_pc("inscritos_2023_suma", "suma_primer_curso_2023")
+    pct_2024 = _calc_pct_vs_pc(f"inscritos_{AÑO_FIN_DATOS}_suma", f"suma_primer_curso_{AÑO_FIN_DATOS}")
+    pct_2023 = _calc_pct_vs_pc(f"inscritos_{AÑO_FIN_DATOS - 1}_suma", f"suma_primer_curso_{AÑO_FIN_DATOS - 1}")
 
-    ag["pct_no_matriculados_2024"] = pct_2024.combine_first(pct_2023)
+    ag[f"pct_no_matriculados_{AÑO_FIN_DATOS}"] = pct_2024.combine_first(pct_2023)
 
     # FUENTE: basado en si inscritos_suma > 0 (no en coherencia ins>=mat)
-    ins24_ok = ag.get("inscritos_2024_suma", pd.Series(0, index=ag.index))
+    ins24_ok = ag.get(f"inscritos_{AÑO_FIN_DATOS}_suma", pd.Series(0, index=ag.index))
     ins24_ok = pd.to_numeric(ins24_ok, errors="coerce").fillna(0) > 0
-    ins23_ok = ag.get("inscritos_2023_suma", pd.Series(0, index=ag.index))
+    ins23_ok = ag.get(f"inscritos_{AÑO_FIN_DATOS - 1}_suma", pd.Series(0, index=ag.index))
     ins23_ok = pd.to_numeric(ins23_ok, errors="coerce").fillna(0) > 0
 
     ag["FUENTE_PCT_NO_MAT"] = "SIN_DATOS"
-    ag.loc[ins24_ok, "FUENTE_PCT_NO_MAT"] = "INSCRITOS_2024"
-    ag.loc[~ins24_ok & ins23_ok, "FUENTE_PCT_NO_MAT"] = "INSCRITOS_2023_FALLBACK"
+    ag.loc[ins24_ok, "FUENTE_PCT_NO_MAT"] = f"INSCRITOS_{AÑO_FIN_DATOS}"
+    ag.loc[~ins24_ok & ins23_ok, "FUENTE_PCT_NO_MAT"] = f"INSCRITOS_{AÑO_FIN_DATOS - 1}_FALLBACK"
 
     ag["tiene_inscritos_reales"] = ins24_ok | ins23_ok
 
     # Inscritos promedio por programa (columna informativa — equivale a "Inscritos Prom" del manual)
-    # = inscritos_suma / num_programas_2024 (programas con matrícula activa)
-    for _yr in [2023, 2024]:
+    # = inscritos_suma / num_programas_{AÑO_FIN_DATOS} (programas con matrícula activa)
+    for _yr in (AÑO_FIN_DATOS - 1, AÑO_FIN_DATOS):
         suma_col = f"inscritos_{_yr}_suma"
-        if suma_col in ag.columns and "num_programas_2024" in ag.columns:
-            _den = pd.to_numeric(ag["num_programas_2024"], errors="coerce").replace(0, np.nan)
+        if suma_col in ag.columns and f"num_programas_{AÑO_FIN_DATOS}" in ag.columns:
+            _den = pd.to_numeric(ag[f"num_programas_{AÑO_FIN_DATOS}"], errors="coerce").replace(0, np.nan)
             _suma = pd.to_numeric(ag[suma_col], errors="coerce")
             ag[f"inscritos_{_yr}_prom_por_programa"] = (_suma / _den).round(1)
         else:
             ag[f"inscritos_{_yr}_prom_por_programa"] = np.nan
 
-    # Variación del promedio por programa de inscritos (2023→2024)
-    if (
-        "inscritos_2023_prom_por_programa" in ag.columns
-        and "inscritos_2024_prom_por_programa" in ag.columns
-    ):
-        _prom23 = pd.to_numeric(ag["inscritos_2023_prom_por_programa"], errors="coerce").replace(0, np.nan)
-        _prom24 = pd.to_numeric(ag["inscritos_2024_prom_por_programa"], errors="coerce")
+    # Variación del promedio por programa de inscritos (penúltimo → último año)
+    _prom_prev_col = f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa"
+    _prom_last_col = f"inscritos_{AÑO_FIN_DATOS}_prom_por_programa"
+    if _prom_prev_col in ag.columns and _prom_last_col in ag.columns:
+        _prom23 = pd.to_numeric(ag[_prom_prev_col], errors="coerce").replace(0, np.nan)
+        _prom24 = pd.to_numeric(ag[_prom_last_col], errors="coerce")
         ag["var_inscritos_prom"] = ((_prom24 - _prom23) / _prom23).clip(-1.0, 3.0)
     else:
         ag["var_inscritos_prom"] = np.nan
 
     # var_inscritos: variación anual de inscripciones
-    if "inscritos_2023_suma" in ag.columns and "inscritos_2024_suma" in ag.columns:
-        ins23 = pd.to_numeric(ag["inscritos_2023_suma"], errors="coerce")
-        ins24 = pd.to_numeric(ag["inscritos_2024_suma"], errors="coerce")
+    if f"inscritos_{AÑO_FIN_DATOS - 1}_suma" in ag.columns and f"inscritos_{AÑO_FIN_DATOS}_suma" in ag.columns:
+        ins23 = pd.to_numeric(ag[f"inscritos_{AÑO_FIN_DATOS - 1}_suma"], errors="coerce")
+        ins24 = pd.to_numeric(ag[f"inscritos_{AÑO_FIN_DATOS}_suma"], errors="coerce")
         den_i = ins23.replace(0, np.nan)
         ag["var_inscritos"] = ((ins24 - ins23) / den_i).clip(-1.0, 3.0)
     else:
         ag["var_inscritos"] = np.nan
 
     # Bloque C: var_programas, pct_con_matricula, prom_matricula_por_programa_2024
-    if "num_programas_2019" in ag.columns and "num_programas_2024" in ag.columns:
-        den_p = ag["num_programas_2019"].replace(0, np.nan)
+    if f"num_programas_{AÑO_INICIO_HISTORICO}" in ag.columns and f"num_programas_{AÑO_FIN_DATOS}" in ag.columns:
+        den_p = ag[f"num_programas_{AÑO_INICIO_HISTORICO}"].replace(0, np.nan)
         ag["var_programas"] = (
-            (ag["num_programas_2024"] - ag["num_programas_2019"]) / den_p
+            (ag[f"num_programas_{AÑO_FIN_DATOS}"] - ag[f"num_programas_{AÑO_INICIO_HISTORICO}"]) / den_p
         ).clip(-1.0, 3.0)  # Acotar a [-100%, +300%] — elimina outliers extremos
         # Nota: fórmula idéntica al archivo manual de referencia.
         # El clip evita que 5 categorías con crecimiento >200% distorsionen el promedio.
     else:
         ag["var_programas"] = np.nan
     if "programas_activos" in ag.columns:
-        ag["pct_con_matricula"] = ag["num_programas_2024"] / ag["programas_activos"].replace(0, np.nan)
+        ag["pct_con_matricula"] = ag[f"num_programas_{AÑO_FIN_DATOS}"] / ag["programas_activos"].replace(0, np.nan)
     else:
         ag["pct_con_matricula"] = np.nan
     # prom_matricula_por_programa_2024 — ahora es prom de nuevos matriculados por programa.
     # Mantener el nombre para compatibilidad con scoring.py y valorizacion_pipeline.py.
-    if "prom_primer_curso_2024" in ag.columns:
-        ag["prom_matricula_por_programa_2024"] = ag["prom_primer_curso_2024"]
-    elif "num_programas_2024" in ag.columns and "suma_matricula_2024" in ag.columns:
-        ag["prom_matricula_por_programa_2024"] = (
-            ag["suma_matricula_2024"] / ag["num_programas_2024"].replace(0, np.nan)
+    if f"prom_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
+        ag[f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"] = ag[f"prom_primer_curso_{AÑO_FIN_DATOS}"]
+    elif f"num_programas_{AÑO_FIN_DATOS}" in ag.columns and f"suma_matricula_{AÑO_FIN_DATOS}" in ag.columns:
+        ag[f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"] = (
+            ag[f"suma_matricula_{AÑO_FIN_DATOS}"] / ag[f"num_programas_{AÑO_FIN_DATOS}"].replace(0, np.nan)
         )
     else:
-        ag["prom_matricula_por_programa_2024"] = np.nan
+        ag[f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"] = np.nan
 
     # Bloque D: distancia_costo_pct por nivel de formación
     # Se calcula a nivel de programa (antes de agregar) para usar el benchmark correcto por nivel
@@ -2134,46 +2143,42 @@ _BLOQUES_TOTAL = [
     ]),
     # ── 1. MATRÍCULAS: SUMA ANUAL ─────────────────────────────────────────
     ("MATRÍCULA SUMA", [
-        "suma_matricula_2019", "suma_matricula_2020", "suma_matricula_2021",
-        "suma_matricula_2022", "suma_matricula_2023", "suma_matricula_2024",
+        f"suma_matricula_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)
     ]),
     # ── 2. MATRÍCULAS: PROMEDIO POR PROGRAMA ─────────────────────────────
     ("MATRÍCULA PROMEDIO", [
-        "prom_matricula_2019", "prom_matricula_2020", "prom_matricula_2021",
-        "prom_matricula_2022", "prom_matricula_2023", "prom_matricula_2024",
+        f"prom_matricula_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)
     ]),
     # ── 3. MATRÍCULAS: VARIACIÓN AÑO A AÑO ───────────────────────────────
     ("VARIACIÓN SUMA", [
-        "var_suma_2020", "var_suma_2021", "var_suma_2022",
-        "var_suma_2023", "var_suma_2024",
+        f"var_suma_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
     ]),
     ("VARIACIÓN PROMEDIO", [
-        "var_prom_2020", "var_prom_2021", "var_prom_2022",
-        "var_prom_2023", "var_prom_2024",
+        f"var_prom_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
     ]),
     # ── 4. PARTICIPACIÓN Y CRECIMIENTO ────────────────────────────────────
     ("PARTICIPACIÓN Y CRECIMIENTO", [
         "NIVEL_MAYORIT",                                    # universo dominante de la categoría
-        "participacion_2019", "participacion_2024",
+        f"participacion_{AÑO_INICIO_HISTORICO}", f"participacion_{AÑO_FIN_DATOS}",
         "AAGR_suma", "AAGR_prom", "CAGR_suma",
         "AAGR_ROBUSTO", "TIPO_CRECIMIENTO",
-        "var_yoy_2024", "diferencial_tendencia", "SEÑAL_TENDENCIA",
+        f"var_yoy_{AÑO_FIN_DATOS}", "diferencial_tendencia", "SEÑAL_TENDENCIA",
     ]),
     # ── 5. DEMANDA NUEVA ───────────────────────────────────────────────────
-    ("DEMANDA NUEVA", [
-        "suma_primer_curso_2019", "suma_primer_curso_2020", "suma_primer_curso_2021",
-        "suma_primer_curso_2022", "suma_primer_curso_2023", "suma_primer_curso_2024",
-        "prom_primer_curso_2019", "prom_primer_curso_2024",
-        "AAGR_primer_curso", "tiene_primer_curso_real",
-    ]),
+    ("DEMANDA NUEVA",
+        [f"suma_primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [f"prom_primer_curso_{AÑO_INICIO_HISTORICO}", f"prom_primer_curso_{AÑO_FIN_DATOS}",
+           "AAGR_primer_curso", "tiene_primer_curso_real"],
+    ),
     # ── 6. INSCRITOS ──────────────────────────────────────────────────────
     ("INSCRITOS", [
-        # Totales suma (nivel categoría)
-        "inscritos_2023_suma", "inscritos_2024_suma",
-        # Promedio por programa (equivalente al \"Prom\" del manual de referencia)
-        "inscritos_2023_prom_por_programa", "inscritos_2024_prom_por_programa",
+        # Totales suma (nivel categoría) — últimos 2 años
+        f"inscritos_{AÑO_FIN_DATOS - 1}_suma", f"inscritos_{AÑO_FIN_DATOS}_suma",
+        # Promedio por programa (equivalente al "Prom" del manual de referencia)
+        f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa",
+        f"inscritos_{AÑO_FIN_DATOS}_prom_por_programa",
         # Tasa no matriculados
-        "pct_no_matriculados_2023", "pct_no_matriculados_2024",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS - 1}", f"pct_no_matriculados_{AÑO_FIN_DATOS}",
         "FUENTE_PCT_NO_MAT",
         # Variaciones
         "var_inscritos",
@@ -2188,7 +2193,7 @@ _BLOQUES_TOTAL = [
     ]),
     # ── 8. OFERTA DE PROGRAMAS ────────────────────────────────────────────
     ("OFERTA", [
-        "num_programas_2019", "num_programas_2024",
+        f"num_programas_{AÑO_INICIO_HISTORICO}", f"num_programas_{AÑO_FIN_DATOS}",
         "programas_activos", "programas_inactivos",
         "programas_nuevos_3a", "nuevos_vs_snapshot",
         "var_programas", "pct_con_matricula",
@@ -2199,28 +2204,24 @@ _BLOQUES_TOTAL = [
         "distancia_costo_pct",
     ]),
     # ── 10. GRADUADOS ─────────────────────────────────────────────────────
-    ("GRADUADOS", [
-        "graduados_2019_suma", "graduados_2020_suma", "graduados_2021_suma",
-        "graduados_2022_suma", "graduados_2023_suma", "graduados_2024_suma",
-        "tasa_graduacion",
-    ]),
+    ("GRADUADOS",
+        [f"graduados_{y}_suma" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + ["tasa_graduacion"],
+    ),
     # ── 11. MATRÍCULAS SEMESTRALES (dato granular, al fondo) ──────────────
     ("MATRÍCULAS SEMESTRALES", [
-        "suma_matricula_2019_1", "suma_matricula_2019_2",
-        "suma_matricula_2020_1", "suma_matricula_2020_2",
-        "suma_matricula_2021_1", "suma_matricula_2021_2",
-        "suma_matricula_2022_1", "suma_matricula_2022_2",
-        "suma_matricula_2023_1", "suma_matricula_2023_2",
-        "suma_matricula_2024_1", "suma_matricula_2024_2",
+        f"suma_matricula_{y}_{s}"
+        for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)
+        for s in (1, 2)
     ]),
     # ── 12. BLOQUE SCORING: valor | score lado a lado (igual que referente) ─
     ("SCORING", [
-        "prom_primer_curso_2024",   "score_matricula",   # valor visible = primer_curso
-        "participacion_2024", "score_participacion",
+        f"prom_primer_curso_{AÑO_FIN_DATOS}",   "score_matricula",   # valor visible = primer_curso
+        f"participacion_{AÑO_FIN_DATOS}", "score_participacion",
         "AAGR_ROBUSTO", "score_AAGR",
         "salario_promedio", "score_salario",
-        "pct_no_matriculados_2024", "score_pct_no_matriculados",
-        "num_programas_2024", "score_num_programas",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}", "score_pct_no_matriculados",
+        f"num_programas_{AÑO_FIN_DATOS}", "score_num_programas",
         "costo_promedio", "score_costo",
     ]),
     # ── 13. CALIFICACIÓN FINAL (extremo derecho, como en el referente) ────
@@ -2356,16 +2357,16 @@ def _escribir_resumen_ejecutivo(
         import datetime
 
         mat_cols = {
-            "2019": "matricula_2019",
-            "2024": "matricula_2024",
+            str(AÑO_INICIO_HISTORICO): f"matricula_{AÑO_INICIO_HISTORICO}",
+            str(AÑO_FIN_DATOS): f"matricula_{AÑO_FIN_DATOS}",
         }
         def _sum_col(df: pd.DataFrame, col: str) -> float:
             if df is None or col not in df.columns:
                 return 0.0
             return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
 
-        mat19 = _sum_col(sabana, mat_cols["2019"])
-        mat24 = _sum_col(sabana, mat_cols["2024"])
+        mat19 = _sum_col(sabana, mat_cols[str(AÑO_INICIO_HISTORICO)])
+        mat24 = _sum_col(sabana, mat_cols[str(AÑO_FIN_DATOS)])
         crecimiento_global_pct = ((mat24 - mat19) / mat19) if mat19 else 0.0
 
         total_programas = int(len(sabana)) if sabana is not None else 0
@@ -2375,10 +2376,10 @@ def _escribir_resumen_ejecutivo(
             pd.to_numeric(sabana.get("es_activo", False), errors="coerce").fillna(0).astype(int).sum()
         ) if isinstance(sabana, pd.DataFrame) else 0
         # tiene_matricula_2024 suele existir en ag; en caso contrario usamos matricula_2024>0
-        if isinstance(sabana, pd.DataFrame) and "tiene_matricula_2024" in sabana.columns:
-            tiene_matricula_2024_sum = int(sabana["tiene_matricula_2024"].fillna(False).astype(bool).sum())
+        if isinstance(sabana, pd.DataFrame) and f"tiene_matricula_{AÑO_FIN_DATOS}" in sabana.columns:
+            tiene_matricula_2024_sum = int(sabana[f"tiene_matricula_{AÑO_FIN_DATOS}"].fillna(False).astype(bool).sum())
         else:
-            tiene_matricula_2024_sum = int(pd.to_numeric(sabana.get("matricula_2024", 0), errors="coerce").fillna(0).gt(0).sum())
+            tiene_matricula_2024_sum = int(pd.to_numeric(sabana.get(f"matricula_{AÑO_FIN_DATOS}", 0), errors="coerce").fillna(0).gt(0).sum())
 
         calif = pd.to_numeric(ag.get("calificacion_final", np.nan), errors="coerce") if isinstance(ag, pd.DataFrame) else pd.Series(dtype=float)
         categorias_verdes   = _sem_verde    if _sem_verde    is not None else int((calif >= 4.0).sum())
@@ -2409,11 +2410,11 @@ def _escribir_resumen_ejecutivo(
         kpis = [
             ("Total programas analizados", total_programas, "#,##0", False),
             ("Total categorías", total_categorias, "#,##0", False),
-            ("Matrícula total 2024", mat24, "#,##0", False),
-            ("Matrícula total 2019", mat19, "#,##0", False),
-            ("Crecimiento global 2019→2024", crecimiento_global_pct, "0.0%", True),
+            (f"Matrícula total {AÑO_FIN_DATOS}", mat24, "#,##0", False),
+            (f"Matrícula total {AÑO_INICIO_HISTORICO}", mat19, "#,##0", False),
+            (f"Crecimiento global {AÑO_INICIO_HISTORICO}→{AÑO_FIN_DATOS}", crecimiento_global_pct, "0.0%", True),
             ("Programas activos", es_activo_sum, "#,##0", False),
-            ("Programas con matrícula 2024", tiene_matricula_2024_sum, "#,##0", False),
+            (f"Programas con matrícula {AÑO_FIN_DATOS}", tiene_matricula_2024_sum, "#,##0", False),
             ("Categorías VERDES (calif. ≥ 4.0)", categorias_verdes, "#,##0", False),
             ("Categorías AMARILLO (3.0-3.9)", categorias_amarillo, "#,##0", False),
             ("Categorías ROJAS (calif. < 3.0)", categorias_rojas, "#,##0", False),
@@ -2473,7 +2474,7 @@ def _escribir_resumen_ejecutivo(
                 for j, dc in enumerate(data_cols):
                     v = row.get(dc, "")
                     number_fmt = None
-                    if dc in {"suma_matricula_2024"}:
+                    if dc in {f"suma_matricula_{AÑO_FIN_DATOS}"}:
                         number_fmt = "#,##0"
                     elif dc in {"AAGR_suma", "AAGR_ROBUSTO"}:
                         number_fmt = "0.0%"
@@ -2493,16 +2494,16 @@ def _escribir_resumen_ejecutivo(
                         border_on=False,
                     )
 
-        # Table A: Top 5 mayor matrícula 2024 (A-D)
+        # Table A: Top 5 mayor matrícula (último año) (A-D)
         write_top_table(
             ag,
-            "🎓 TOP 5 — MAYOR MATRÍCULA 2024",
+            f"🎓 TOP 5 — MAYOR MATRÍCULA {AÑO_FIN_DATOS}",
             start_row,
             1,
-            ["Categoría", "Matrícula 2024", "Calificación", "Crecimiento AAGR"],
-            ["CATEGORIA_FINAL", "suma_matricula_2024", "calificacion_final", "AAGR_ROBUSTO"],
+            ["Categoría", f"Matrícula {AÑO_FIN_DATOS}", "Calificación", "Crecimiento AAGR"],
+            ["CATEGORIA_FINAL", f"suma_matricula_{AÑO_FIN_DATOS}", "calificacion_final", "AAGR_ROBUSTO"],
             5,
-            "suma_matricula_2024",
+            f"suma_matricula_{AÑO_FIN_DATOS}",
             ascending=False,
         )
 
@@ -2512,8 +2513,8 @@ def _escribir_resumen_ejecutivo(
             "📈 TOP 5 — MAYOR CRECIMIENTO",
             start_row,
             6,
-            ["Categoría", "AAGR", "Matrícula 2024", "Calificación"],
-            ["CATEGORIA_FINAL", "AAGR_ROBUSTO", "suma_matricula_2024", "calificacion_final"],
+            ["Categoría", "AAGR", f"Matrícula {AÑO_FIN_DATOS}", "Calificación"],
+            ["CATEGORIA_FINAL", "AAGR_ROBUSTO", f"suma_matricula_{AÑO_FIN_DATOS}", "calificacion_final"],
             5,
             "AAGR_ROBUSTO",
             ascending=False,
@@ -2539,8 +2540,8 @@ def _escribir_resumen_ejecutivo(
             "📉 TOP 5 — MENOR CRECIMIENTO",
             start_row_c,
             6,
-            ["Categoría", "AAGR", "Matrícula 2024", "Calificación"],
-            ["CATEGORIA_FINAL", "AAGR_ROBUSTO", "suma_matricula_2024", "calificacion_final"],
+            ["Categoría", "AAGR", f"Matrícula {AÑO_FIN_DATOS}", "Calificación"],
+            ["CATEGORIA_FINAL", "AAGR_ROBUSTO", f"suma_matricula_{AÑO_FIN_DATOS}", "calificacion_final"],
             5,
             "AAGR_ROBUSTO",
             ascending=True,
@@ -2650,12 +2651,12 @@ def run_analisis_regional(
     if col_nivel in sabana.columns and NIVELES_POSGRADO:
         sabana = sabana[sabana[col_nivel].isin(NIVELES_POSGRADO)].copy()
 
-    years = list(range(2019, 2025))
+    years = list(range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1))
     registros: list[dict] = []
 
     for (cat, dept), grupo in sabana.groupby(["CATEGORIA_FINAL", COL_DEPT]):
         mat_2024 = (
-            pd.to_numeric(grupo.get("matricula_2024", pd.Series(dtype=float)), errors="coerce")
+            pd.to_numeric(grupo.get(f"matricula_{AÑO_FIN_DATOS}", pd.Series(dtype=float)), errors="coerce")
             .fillna(0)
             .sum()
         )
@@ -2664,11 +2665,11 @@ def run_analisis_regional(
             "REGION": _REGION_MAP.get(dept, "Otra"),
             "DEPARTAMENTO": dept,
             "CATEGORIA_FINAL": cat,
-            "num_programas_regional_2024": int(
-                (pd.to_numeric(grupo.get("matricula_2024", pd.Series(dtype=float)), errors="coerce")
+            f"num_programas_regional_{AÑO_FIN_DATOS}": int(
+                (pd.to_numeric(grupo.get(f"matricula_{AÑO_FIN_DATOS}", pd.Series(dtype=float)), errors="coerce")
                  .fillna(0) > 0).sum()
             ),
-            "suma_matricula_regional_2024": mat_2024,
+            f"suma_matricula_regional_{AÑO_FIN_DATOS}": mat_2024,
             "DATOS_INSUFICIENTES": mat_2024 < UMBRAL_REGIONAL_MATRICULA,
         }
 
@@ -2686,7 +2687,7 @@ def run_analisis_regional(
 
         # Variaciones y AAGR regional
         vars_suma: list[float] = []
-        for y in range(2020, 2025):
+        for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
             if y in sumas and (y - 1) in sumas and sumas[y - 1] > 0:
                 v = (sumas[y] - sumas[y - 1]) / sumas[y - 1]
                 fila[f"var_suma_regional_{y}"] = v
@@ -2696,29 +2697,34 @@ def run_analisis_regional(
 
         fila["AAGR_regional"] = float(np.mean(vars_suma)) if vars_suma else np.nan
 
-        # CAGR regional
-        m19 = sumas.get(2019, 0)
-        m24 = sumas.get(2024, 0)
-        fila["CAGR_regional"] = float((m24 / m19) ** (1 / 5) - 1) if m19 > 0 and m24 > 0 else np.nan
+        # CAGR regional (sobre el rango histórico completo)
+        m19 = sumas.get(AÑO_INICIO_HISTORICO, 0)
+        m24 = sumas.get(AÑO_FIN_DATOS, 0)
+        _n_years_cagr = max(AÑO_FIN_DATOS - AÑO_INICIO_HISTORICO, 1)
+        fila["CAGR_regional"] = (
+            float((m24 / m19) ** (1 / _n_years_cagr) - 1) if m19 > 0 and m24 > 0 else np.nan
+        )
 
         # Participación regional sobre el total nacional
         total_nacional_2024 = (
-            ag_nacional["suma_matricula_2024"].sum()
-            if "suma_matricula_2024" in ag_nacional.columns else 0
+            ag_nacional[f"suma_matricula_{AÑO_FIN_DATOS}"].sum()
+            if f"suma_matricula_{AÑO_FIN_DATOS}" in ag_nacional.columns else 0
         )
-        fila["participacion_regional_2024"] = (m24 / total_nacional_2024) if total_nacional_2024 > 0 else np.nan
+        fila[f"participacion_regional_{AÑO_FIN_DATOS}"] = (
+            (m24 / total_nacional_2024) if total_nacional_2024 > 0 else np.nan
+        )
 
         # Referencia nacional para comparación directa
         fila_nac = ag_nacional[ag_nacional["CATEGORIA_FINAL"] == cat]
         if len(fila_nac) == 1:
             nac = fila_nac.iloc[0]
-            fila["suma_matricula_nacional_2024"] = nac.get("suma_matricula_2024", np.nan)
+            fila[f"suma_matricula_nacional_{AÑO_FIN_DATOS}"] = nac.get(f"suma_matricula_{AÑO_FIN_DATOS}", np.nan)
             fila["AAGR_nacional"]                = nac.get("AAGR_suma", np.nan)
             fila["calificacion_nacional"]         = nac.get("calificacion_final", np.nan)
-            mat_nac = nac.get("suma_matricula_2024", 0) or 0
+            mat_nac = nac.get(f"suma_matricula_{AÑO_FIN_DATOS}", 0) or 0
             fila["pct_mercado_regional"] = (m24 / mat_nac) if mat_nac > 0 else np.nan
         else:
-            fila["suma_matricula_nacional_2024"] = np.nan
+            fila[f"suma_matricula_nacional_{AÑO_FIN_DATOS}"] = np.nan
             fila["AAGR_nacional"]                = np.nan
             fila["calificacion_nacional"]         = np.nan
             fila["pct_mercado_regional"]          = np.nan
@@ -2774,7 +2780,7 @@ def _exportar_estudio_segmento(
     NAC_COLS = {
         "calificacion_final": "calificacion_nacional",
         "AAGR_ROBUSTO": "AAGR_ROBUSTO_nacional",
-        "suma_matricula_2024": "suma_matricula_nacional_2024",
+        f"suma_matricula_{AÑO_FIN_DATOS}": f"suma_matricula_nacional_{AÑO_FIN_DATOS}",
     }
     keys = [k for k in NAC_COLS if k in ag_nacional.columns]
     if not keys:
@@ -2861,10 +2867,10 @@ def _exportar_estudio_segmento(
                     "calificacion_nacional",
                     "AAGR_ROBUSTO",
                     "AAGR_ROBUSTO_nacional",
-                    "suma_matricula_2024",
-                    "suma_matricula_nacional_2024",
-                    "participacion_2024",
-                    "num_programas_2024",
+                    f"suma_matricula_{AÑO_FIN_DATOS}",
+                    f"suma_matricula_nacional_{AÑO_FIN_DATOS}",
+                    f"participacion_{AÑO_FIN_DATOS}",
+                    f"num_programas_{AÑO_FIN_DATOS}",
                 ]
                 ctx_export = ag_con_nac[[c for c in ctx_cols if c in ag_con_nac.columns]].copy()
                 ctx_export = ctx_export.rename(
@@ -2873,10 +2879,10 @@ def _exportar_estudio_segmento(
                         "calificacion_nacional": "Calif. nacional",
                         "AAGR_ROBUSTO": "AAGR segmento",
                         "AAGR_ROBUSTO_nacional": "AAGR nacional",
-                        "suma_matricula_2024": "Matrícula segmento 2024",
-                        "suma_matricula_nacional_2024": "Matrícula nacional 2024",
-                        "participacion_2024": "Participación segmento",
-                        "num_programas_2024": "N° programas segmento",
+                        f"suma_matricula_{AÑO_FIN_DATOS}": f"Matrícula segmento {AÑO_FIN_DATOS}",
+                        f"suma_matricula_nacional_{AÑO_FIN_DATOS}": f"Matrícula nacional {AÑO_FIN_DATOS}",
+                        f"participacion_{AÑO_FIN_DATOS}": "Participación segmento",
+                        f"num_programas_{AÑO_FIN_DATOS}": "N° programas segmento",
                     }
                 )
                 if "Calif. segmento" in ctx_export.columns:
@@ -3097,9 +3103,9 @@ def _escribir_hoja_delta(
     cols_snap = [
         "CATEGORIA_FINAL",
         "calificacion_final",
-        "suma_matricula_2024",
+        f"suma_matricula_{AÑO_FIN_DATOS}",
         "AAGR_ROBUSTO",
-        "num_programas_2024",
+        f"num_programas_{AÑO_FIN_DATOS}",
     ]
     cols_pres = [c for c in cols_snap if c in ag_nuevo.columns]
     if "CATEGORIA_FINAL" not in cols_pres:
@@ -3130,9 +3136,9 @@ def _escribir_hoja_delta(
         df_ant = df_ant.rename(
             columns={
                 "calificacion_final": "calif_anterior",
-                "suma_matricula_2024": "matricula_anterior",
+                f"suma_matricula_{AÑO_FIN_DATOS}": "matricula_anterior",
                 "AAGR_ROBUSTO": "aagr_anterior",
-                "num_programas_2024": "programas_anterior",
+                f"num_programas_{AÑO_FIN_DATOS}": "programas_anterior",
             }
         )
 
@@ -3146,7 +3152,7 @@ def _escribir_hoja_delta(
         merged["semaforo_nuevo"] = merged["calificacion_final"].apply(_semaforo)
         merged["semaforo_anterior"] = merged["calif_anterior"].apply(_semaforo)
         merged["delta_calif"] = merged["calificacion_final"] - merged["calif_anterior"]
-        merged["delta_matricula"] = merged["suma_matricula_2024"] - merged["matricula_anterior"]
+        merged["delta_matricula"] = merged[f"suma_matricula_{AÑO_FIN_DATOS}"] - merged["matricula_anterior"]
         merged["cambio_semaforo"] = merged["semaforo_nuevo"] != merged["semaforo_anterior"]
 
         def _tipo(row):
@@ -3193,10 +3199,10 @@ def _escribir_hoja_delta(
             "semaforo_anterior",
             "calif_anterior",
             "delta_calif",
-            "suma_matricula_2024",
+            f"suma_matricula_{AÑO_FIN_DATOS}",
             "matricula_anterior",
             "delta_matricula",
-            "num_programas_2024",
+            f"num_programas_{AÑO_FIN_DATOS}",
             "programas_anterior",
         ]
         cols_export = [c for c in cols_export if c in merged.columns]
@@ -3636,13 +3642,13 @@ def run_gap_oportunidades(ag: pd.DataFrame, log) -> pd.DataFrame:
         "CATEGORIA_FINAL",
         "calificacion_final",
         "AAGR_ROBUSTO",
-        "suma_matricula_2024",
-        "var_yoy_2024",
+        f"suma_matricula_{AÑO_FIN_DATOS}",
+        f"var_yoy_{AÑO_FIN_DATOS}",
         "diferencial_tendencia",
         "SEÑAL_TENDENCIA",
         "salario_promedio",
-        "num_programas_2024",
-        "prom_matricula_por_programa_2024",
+        f"num_programas_{AÑO_FIN_DATOS}",
+        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}",
         "costo_promedio",
         "distancia_costo_pct",
         "tasa_graduacion",
@@ -3660,7 +3666,7 @@ def run_gap_oportunidades(ag: pd.DataFrame, log) -> pd.DataFrame:
     def _prioridad(row) -> str:
         cal = row.get("calificacion_final", 0) or 0
         senal = str(row.get("SEÑAL_TENDENCIA", "")).strip()
-        mat = row.get("suma_matricula_2024", 0) or 0
+        mat = row.get(f"suma_matricula_{AÑO_FIN_DATOS}", 0) or 0
         if cal >= 4.0 and senal in ("ACELERANDO", "ESTABLE"):
             return "1 - ALTA"
         if cal >= 4.0 and senal == "DESACELERANDO":
@@ -3838,13 +3844,13 @@ def run_fase6(ag: pd.DataFrame, log) -> pd.DataFrame:
     COLS_MERCADO = [
         "CATEGORIA_FINAL",
         "calificacion_final",
-        "suma_matricula_2024",
+        f"suma_matricula_{AÑO_FIN_DATOS}",
         "AAGR_ROBUSTO",
         "AAGR_suma",
         "salario_promedio",
-        "num_programas_2024",
+        f"num_programas_{AÑO_FIN_DATOS}",
         "programas_nuevos_3a",
-        "pct_no_matriculados_2024",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}",
         "costo_promedio",
         "score_matricula",
         "score_AAGR",
@@ -3866,8 +3872,8 @@ def run_fase6(ag: pd.DataFrame, log) -> pd.DataFrame:
     for c in ["calificacion_final", "AAGR_suma", "AAGR_ROBUSTO"]:
         if c in df_result.columns:
             df_result[c] = pd.to_numeric(df_result[c], errors="coerce")
-    if "suma_matricula_2024" in df_result.columns:
-        df_result["suma_matricula_2024"] = pd.to_numeric(df_result["suma_matricula_2024"], errors="coerce")
+    if f"suma_matricula_{AÑO_FIN_DATOS}" in df_result.columns:
+        df_result[f"suma_matricula_{AÑO_FIN_DATOS}"] = pd.to_numeric(df_result[f"suma_matricula_{AÑO_FIN_DATOS}"], errors="coerce")
     if "salario_promedio" in df_result.columns:
         df_result["salario_promedio"] = pd.to_numeric(df_result["salario_promedio"], errors="coerce")
     if "costo_promedio" in df_result.columns:
@@ -3922,9 +3928,9 @@ def run_fase6(ag: pd.DataFrame, log) -> pd.DataFrame:
         "OPORTUNIDAD",
         "calificacion_final",
         "AAGR_PCT",
-        "suma_matricula_2024",
+        f"suma_matricula_{AÑO_FIN_DATOS}",
         "salario_promedio",
-        "num_programas_2024",
+        f"num_programas_{AÑO_FIN_DATOS}",
         "costo_promedio",
         "AAGR_primer_curso",
         "tasa_graduacion",
@@ -4042,14 +4048,14 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
                 except (TypeError, ValueError):
                     pass
 
-            elif col_name in ("AAGR_ROBUSTO", "var_yoy_2024", "diferencial_tendencia",
+            elif col_name in ("AAGR_ROBUSTO", f"var_yoy_{AÑO_FIN_DATOS}", "diferencial_tendencia",
                               "distancia_costo_pct", "tasa_graduacion"):
                 cell.fill = base_fill
                 cell.number_format = "0.0%"
                 cell.font = Font(name="Arial", size=10)
 
-            elif col_name in ("suma_matricula_2024", "num_programas_2024",
-                              "prom_matricula_por_programa_2024"):
+            elif col_name in (f"suma_matricula_{AÑO_FIN_DATOS}", f"num_programas_{AÑO_FIN_DATOS}",
+                              f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"):
                 cell.fill = base_fill
                 cell.number_format = "#,##0"
                 cell.font = Font(name="Arial", size=10)
@@ -4075,13 +4081,13 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
         "PRIORIDAD_ESTRATEGICA": 22,
         "calificacion_final": 14,
         "AAGR_ROBUSTO": 13,
-        "suma_matricula_2024": 16,
-        "var_yoy_2024": 13,
+        f"suma_matricula_{AÑO_FIN_DATOS}": 16,
+        f"var_yoy_{AÑO_FIN_DATOS}": 13,
         "diferencial_tendencia": 18,
         "SEÑAL_TENDENCIA": 20,
         "salario_promedio": 14,
-        "num_programas_2024": 14,
-        "prom_matricula_por_programa_2024": 18,
+        f"num_programas_{AÑO_FIN_DATOS}": 14,
+        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": 18,
         "costo_promedio": 14,
         "distancia_costo_pct": 15,
         "tasa_graduacion": 14,
@@ -4110,13 +4116,13 @@ def _escribir_hoja_total(
     NOMBRES_LEGIBLES = {
         "calificacion_final": "Calificación",
         "TIPO_CRECIMIENTO": "Tipo Crecim.",
-        "prom_matricula_2024": "Prom. Mat. 2024",
-        "participacion_2024": "Participación",
+        f"prom_matricula_{AÑO_FIN_DATOS}": f"Prom. Mat. {AÑO_FIN_DATOS}",
+        f"participacion_{AÑO_FIN_DATOS}": "Participación",
         "AAGR_ROBUSTO": "AAGR Robusto",
         "salario_promedio": "Salario (SMLMV)",
-        "pct_no_matriculados_2024": "% No Matr. 2024",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}": f"% No Matr. {AÑO_FIN_DATOS}",
         "FUENTE_PCT_NO_MAT": "Fuente % No Matr.",
-        "num_programas_2024": "N° Programas",
+        f"num_programas_{AÑO_FIN_DATOS}": "N° Programas",
         "distancia_costo_pct": "Dist. Costo %",
         "score_matricula": "S. Mat",
         "score_participacion": "S. Part",
@@ -4125,20 +4131,20 @@ def _escribir_hoja_total(
         "score_pct_no_matriculados": "S. No-Mat",
         "score_num_programas": "S. Prog",
         "score_costo": "S. Costo",
-        "suma_matricula_2024": "Matr. 2024",
-        "suma_matricula_2019": "Matr. 2019",
+        f"suma_matricula_{AÑO_FIN_DATOS}": f"Matr. {AÑO_FIN_DATOS}",
+        f"suma_matricula_{AÑO_INICIO_HISTORICO}": f"Matr. {AÑO_INICIO_HISTORICO}",
         "AAGR_suma": "AAGR Suma",
         "CAGR_suma": "CAGR Suma",
         "tasa_graduacion": "Tasa Grad.",
         "salario_proyectado_pesos_hoy": "Salario (Pesos)",
         "costo_promedio": "Costo Prom.",
-        "num_programas_2019": "N° Prog. 2019",
+        f"num_programas_{AÑO_INICIO_HISTORICO}": f"N° Prog. {AÑO_INICIO_HISTORICO}",
         "programas_activos": "Prog. Activos",
         "programas_inactivos": "Prog. Inactivos",
         "programas_nuevos_3a": "Prog. Nuevos 3a",
         "pct_con_matricula": "% Con Matr.",
-        "inscritos_2023_prom_por_programa": "Ins. 2023 Prom/Prog",
-        "inscritos_2024_prom_por_programa": "Ins. 2024 Prom/Prog",
+        f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa": f"Ins. {AÑO_FIN_DATOS - 1} Prom/Prog",
+        f"inscritos_{AÑO_FIN_DATOS}_prom_por_programa": f"Ins. {AÑO_FIN_DATOS} Prom/Prog",
         "var_inscritos_prom": "Var. Ins. Prom",
         "CAT_ID": "ID Categoría",
     }
@@ -4311,7 +4317,7 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
                     size=10,
                 )
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-            elif col_name == "var_yoy_2024":
+            elif col_name == f"var_yoy_{AÑO_FIN_DATOS}":
                 cell.number_format = "0.0%"
                 # Color degradado según magnitud: rojo si cae, verde si sube fuerte
                 try:

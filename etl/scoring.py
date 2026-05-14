@@ -6,7 +6,8 @@ Cada variable se mapea a score 1-5 según umbrales; calificacion_final = suma(sc
 score_matricula: modo_local=False → quintiles fijos nacionales (P20/P40/P60/P80) sobre Colombia.
                  modo_local=True  → quintiles dinámicos del segmento (regional/modal).
 
-score_participacion: quintiles por **cuantiles del segmento** actual (``participacion_2024``).
+score_participacion: quintiles por **cuantiles del segmento** actual
+(``participacion_<AÑO_FIN_DATOS>``).
 """
 
 from __future__ import annotations
@@ -14,6 +15,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# AÑO_FIN_DATOS debe importarse ANTES de SCORING_CONFIG porque las f-strings de
+# nombres de columna se evalúan al cargar el módulo.
+from etl.config import AÑO_FIN_DATOS
 from etl.pipeline_logger import log_info
 
 # Pesos de las dos métricas con lógica propia (deben coincidir con el resto de SCORING_CONFIG).
@@ -78,14 +82,14 @@ SCORING_CONFIG = [
         "inverse": False,
     },
     {
-        "col": "pct_no_matriculados_2024",
+        "col": f"pct_no_matriculados_{AÑO_FIN_DATOS}",
         "out": "score_pct_no_matriculados",
         "peso": 0.10,
         "thresholds": [(0.10, 5), (0.20, 4), (0.30, 3), (0.50, 2)],
         "inverse": True,
     },
     {
-        "col": "num_programas_2024",
+        "col": f"num_programas_{AÑO_FIN_DATOS}",
         "out": "score_num_programas",
         "peso": 0.05,
         # Percentiles reales posgrado-only (ESP+MAE, 288 cats):
@@ -128,7 +132,7 @@ SCORING_CONFIG_PREGRADO: list[dict] = [
         "inverse": False,
     },
     {
-        "col": "pct_no_matriculados_2024",
+        "col": f"pct_no_matriculados_{AÑO_FIN_DATOS}",
         "out": "score_pct_no_matriculados",
         "peso": 0.10,
         # P20=0.273 P40=0.408 P60=0.509 P80=0.623 (real pipeline, 146 cats)
@@ -137,7 +141,7 @@ SCORING_CONFIG_PREGRADO: list[dict] = [
         "inverse": True,
     },
     {
-        "col": "num_programas_2024",
+        "col": f"num_programas_{AÑO_FIN_DATOS}",
         "out": "score_num_programas",
         "peso": 0.05,
         # P20=1 P40=5 P60=19 P80=55 (real pipeline, 146 cats)
@@ -210,10 +214,10 @@ def apply_scoring(
 
     # ── DIAGNÓSTICO DE DISTRIBUCIÓN ───────────────────────────────────────────
     _cols_diag = {
-        "prom_primer_curso_2024": "PRIMER_CURSO",
-        "prom_matricula_por_programa_2024": "MAT",
-        "prom_matricula_2024": "MAT_PROM",
-        "participacion_2024": "PART",
+        f"prom_primer_curso_{AÑO_FIN_DATOS}": "PRIMER_CURSO",
+        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": "MAT",
+        f"prom_matricula_{AÑO_FIN_DATOS}": "MAT_PROM",
+        f"participacion_{AÑO_FIN_DATOS}": "PART",
         "AAGR_ROBUSTO": "AAGR",
         "salario_promedio_smlmv": "SAL",
     }
@@ -228,17 +232,18 @@ def apply_scoring(
                     f"P60={_pcts[3]:.4g} P80={_pcts[4]:.4g} P90={_pcts[5]:.4g}"
                 )
 
-    # Con inscritos SNIES (fuente primaria desde 2025), la cobertura es >80%.
+    # Con inscritos SNIES (fuente primaria), la cobertura es >80%.
     PCT_NAN_FILL = 0.25
-    if "pct_no_matriculados_2024" in out.columns:
-        out["pct_no_matriculados_2024"] = out["pct_no_matriculados_2024"].fillna(PCT_NAN_FILL)
+    _col_pct_nm = f"pct_no_matriculados_{AÑO_FIN_DATOS}"
+    if _col_pct_nm in out.columns:
+        out[_col_pct_nm] = out[_col_pct_nm].fillna(PCT_NAN_FILL)
 
     # score_matricula — thresholds nacionales fijos (modo_local=False)
     #                   o quintiles locales dinámicos (modo_local=True).
-    if "prom_matricula_por_programa_2024" in out.columns:
-        _s_mat = pd.to_numeric(out["prom_matricula_por_programa_2024"], errors="coerce")
-    elif "prom_matricula_2024" in out.columns:
-        _s_mat = pd.to_numeric(out["prom_matricula_2024"], errors="coerce")
+    if f"prom_matricula_por_programa_{AÑO_FIN_DATOS}" in out.columns:
+        _s_mat = pd.to_numeric(out[f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"], errors="coerce")
+    elif f"prom_matricula_{AÑO_FIN_DATOS}" in out.columns:
+        _s_mat = pd.to_numeric(out[f"prom_matricula_{AÑO_FIN_DATOS}"], errors="coerce")
     else:
         _s_mat = None
 
@@ -296,8 +301,8 @@ def apply_scoring(
         out["score_matricula"] = 1
 
     # score_participacion — cuantiles del segmento en curso (mercado regional relativo)
-    if "participacion_2024" in out.columns:
-        _part_series = pd.to_numeric(out["participacion_2024"], errors="coerce")
+    if f"participacion_{AÑO_FIN_DATOS}" in out.columns:
+        _part_series = pd.to_numeric(out[f"participacion_{AÑO_FIN_DATOS}"], errors="coerce")
         _p20 = float(_part_series.quantile(0.20))
         _p40 = float(_part_series.quantile(0.40))
         _p60 = float(_part_series.quantile(0.60))

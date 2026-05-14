@@ -87,6 +87,10 @@ def _get_config_file_path() -> Path:
     return default_base / "config.json"
 
 
+# Ruta pública a config.json (misma que usa _load_config / GUI).
+CONFIG_PATH: Path = _get_config_file_path()
+
+
 # Caché de configuración para evitar lecturas repetidas del disco
 _config_cache: dict | None = None
 _config_cache_mtime: float | None = None
@@ -298,6 +302,17 @@ SMLMV_POR_ANO: dict[int, int] = {
     2025: 1_423_500,
 }
 
+# ── Rango de años con datos SNIES disponibles ─────────────────────────────────
+# AÑO_INICIO_HISTORICO    : primer año en ref/backup/ (matrícula, inscritos, etc.)
+# AÑO_FIN_DATOS           : último año con datos completos → ACTUALIZAR cuando lleguen datos nuevos
+# AÑO_INICIO_PRIMER_CURSO : primer año disponible en archivos primer_curso_*.xlsx
+#
+# Para soportar p. ej. 2025: añadir "AÑO_FIN_DATOS": 2025 en config.json
+# (no requiere modificar ningún archivo Python).
+AÑO_INICIO_HISTORICO: int = 2019
+AÑO_FIN_DATOS: int = 2024
+AÑO_INICIO_PRIMER_CURSO: int = 2014
+
 try:
     _cfg = _load_config()
     if isinstance(_cfg.get("BENCHMARK_COSTO_PREGRADO"), (int, float)) and _cfg["BENCHMARK_COSTO_PREGRADO"] > 0:
@@ -317,8 +332,51 @@ try:
     # Fallback genérico (mantener compatibilidad)
     if isinstance(_cfg.get("BENCHMARK_COSTO"), (int, float)) and _cfg["BENCHMARK_COSTO"] > 0:
         BENCHMARK_COSTO = float(_cfg["BENCHMARK_COSTO"])
+    # ── Override de rango de años desde config.json ────────────────────────
+    if isinstance(_cfg.get("AÑO_FIN_DATOS"), int) and _cfg["AÑO_FIN_DATOS"] > 2019:
+        AÑO_FIN_DATOS = int(_cfg["AÑO_FIN_DATOS"])
+    if isinstance(_cfg.get("AÑO_INICIO_HISTORICO"), int) and _cfg["AÑO_INICIO_HISTORICO"] >= 2015:
+        AÑO_INICIO_HISTORICO = int(_cfg["AÑO_INICIO_HISTORICO"])
+    if isinstance(_cfg.get("AÑO_INICIO_PRIMER_CURSO"), int) and _cfg["AÑO_INICIO_PRIMER_CURSO"] >= 2010:
+        AÑO_INICIO_PRIMER_CURSO = int(_cfg["AÑO_INICIO_PRIMER_CURSO"])
+    if isinstance(_cfg.get("SMLMV_POR_ANO"), dict):
+        for _k, _v in _cfg["SMLMV_POR_ANO"].items():
+            try:
+                SMLMV_POR_ANO[int(_k)] = int(_v)
+            except (TypeError, ValueError, KeyError):
+                pass
 except Exception:
     pass
+
+
+def invalidate_config_cache() -> None:
+    """Invalida la caché en memoria de config.json para forzar la próxima lectura desde disco."""
+    global _config_cache, _config_cache_mtime
+    _config_cache = None
+    _config_cache_mtime = None
+
+
+def reload_year_and_smlmv_from_config_file() -> None:
+    """
+    Vuelve a leer config.json y actualiza AÑO_* y SMLMV_POR_ANO en el proceso actual.
+    Útil tras guardar cambios desde la GUI sin reiniciar la aplicación.
+    """
+    global AÑO_FIN_DATOS, AÑO_INICIO_HISTORICO, AÑO_INICIO_PRIMER_CURSO, SMLMV_POR_ANO
+    invalidate_config_cache()
+    c = _load_config()
+    if isinstance(c.get("AÑO_FIN_DATOS"), int) and c["AÑO_FIN_DATOS"] > 2019:
+        AÑO_FIN_DATOS = int(c["AÑO_FIN_DATOS"])
+    if isinstance(c.get("AÑO_INICIO_HISTORICO"), int) and c["AÑO_INICIO_HISTORICO"] >= 2015:
+        AÑO_INICIO_HISTORICO = int(c["AÑO_INICIO_HISTORICO"])
+    if isinstance(c.get("AÑO_INICIO_PRIMER_CURSO"), int) and c["AÑO_INICIO_PRIMER_CURSO"] >= 2010:
+        AÑO_INICIO_PRIMER_CURSO = int(c["AÑO_INICIO_PRIMER_CURSO"])
+    if isinstance(c.get("SMLMV_POR_ANO"), dict):
+        for _k, _v in c["SMLMV_POR_ANO"].items():
+            try:
+                SMLMV_POR_ANO[int(_k)] = int(_v)
+            except (TypeError, ValueError, KeyError):
+                pass
+
 
 def obtener_smlmv_vigente() -> int:
     """

@@ -3109,9 +3109,292 @@ class ImputationPage(ttk.Frame):
         # No recargar automáticamente aquí porque los resultados ya se muestran en actualizar_ui()
         # Si el usuario quiere ver el estado actualizado, puede usar el botón "Recargar"
     
-    # NOTA: La función _actualizar_historico fue eliminada porque la imputación
-    # solo debe guardar en Programas.xlsx, NO en el histórico.
-    # El histórico se actualiza automáticamente al finalizar el pipeline.
+        # NOTA: La función _actualizar_historico fue eliminada porque la imputación
+        # solo debe guardar en Programas.xlsx, NO en el histórico.
+        # El histórico se actualiza automáticamente al finalizar el pipeline.
+
+
+class ConfiguracionDialog(tk.Toplevel):
+    """
+    Diálogo modal de configuración del sistema.
+    Permite cambiar AÑO_FIN_DATOS, ver estado de archivos en ref/backup/ y actualizar SMLMV_POR_ANO.
+    Los cambios se guardan en config.json.
+    """
+
+    _ARCHIVOS_REQUERIDOS: dict[str, str] = {
+        "Matrícula": "matriculados_{año}.xlsx",
+        "Inscritos": "inscritos_{año}.xlsx",
+        "Primer curso": "primer_curso_{año}.xlsx",
+        "Graduados": "graduados_{año}.xlsx",
+    }
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("⚙️ Configuración del Sistema")
+        self.resizable(False, False)
+        self.configure(bg=EAFIT["bg"])
+
+        self.update_idletasks()
+        w, h = 620, 600
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        self._cfg = self._cargar_config()
+        try:
+            from etl.config import AÑO_FIN_DATOS as _afd
+
+            _def_año = int(_afd)
+        except Exception:
+            _def_año = 2024
+        self._año_var = tk.IntVar(value=int(self._cfg.get("AÑO_FIN_DATOS", _def_año)))
+        self._smlmv_vars: dict[int, tk.StringVar] = {}
+        self._file_labels: dict[str, tuple[ttk.Label, ttk.Label]] = {}
+
+        self._build_ui()
+        self._año_var.trace_add("write", lambda *_: self.after_idle(self._refresh_archivos))
+        self._refresh_archivos()
+
+    @staticmethod
+    def _cargar_config() -> dict:
+        try:
+            from etl.config import CONFIG_PATH
+
+            if CONFIG_PATH.exists():
+                return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _guardar_config(cfg: dict) -> None:
+        from etl.config import CONFIG_PATH
+
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(
+            json.dumps(cfg, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _get_ref_backup() -> Path:
+        from etl.config import REF_DIR
+
+        return REF_DIR / "backup"
+
+    def _build_ui(self) -> None:
+        main = ttk.Frame(self, padding=24, style="App.TFrame")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main, text="Configuración del Sistema", style="Header.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            main,
+            text="Los cambios se guardan en config.json y se aplican al guardar (año y SMLMV en esta sesión).",
+            style="SubHeader.TLabel",
+        ).pack(anchor="w", pady=(0, 18))
+
+        sec1 = ttk.Frame(main, padding=18, style="Card.TFrame")
+        sec1.pack(fill=tk.X, pady=(0, 14))
+
+        ttk.Label(sec1, text="📅  Año de datos activo", style="SectionTitle.TLabel").pack(anchor="w", pady=(0, 10))
+
+        año_row = ttk.Frame(sec1, style="Card.TFrame")
+        año_row.pack(fill=tk.X)
+
+        ttk.Label(año_row, text="AÑO_FIN_DATOS:", style="Muted.TLabel", font=("Segoe UI", 10)).pack(side=tk.LEFT)
+
+        spin = ttk.Spinbox(
+            año_row,
+            from_=2019,
+            to=2035,
+            textvariable=self._año_var,
+            width=8,
+            font=("Segoe UI", 11, "bold"),
+        )
+        spin.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(
+            año_row,
+            text="  ← cambia el año cuando lleguen los archivos nuevos",
+            style="Muted.TLabel",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        sec2 = ttk.Frame(main, padding=18, style="Card.TFrame")
+        sec2.pack(fill=tk.X, pady=(0, 14))
+
+        ttk.Label(sec2, text="📁  Archivos disponibles en ref/backup/", style="SectionTitle.TLabel").pack(
+            anchor="w", pady=(0, 10)
+        )
+
+        grid = ttk.Frame(sec2, style="Card.TFrame")
+        grid.pack(fill=tk.X)
+
+        for i, (tipo, patron) in enumerate(self._ARCHIVOS_REQUERIDOS.items()):
+            row = i // 2
+            col = (i % 2) * 3
+
+            ttk.Label(grid, text=tipo + ":", style="Muted.TLabel", width=15, anchor="w").grid(
+                row=row, column=col, sticky="w", padx=(0, 4), pady=3
+            )
+
+            lbl_nombre = ttk.Label(grid, text="—", style="Muted.TLabel", font=("Segoe UI", 9), width=28, anchor="w")
+            lbl_nombre.grid(row=row, column=col + 1, sticky="w", pady=3)
+
+            lbl_estado = ttk.Label(
+                grid, text="", style="Muted.TLabel", font=("Segoe UI", 10, "bold"), width=4, anchor="center"
+            )
+            lbl_estado.grid(row=row, column=col + 2, sticky="w", padx=(0, 16), pady=3)
+
+            self._file_labels[tipo] = (lbl_nombre, lbl_estado)
+
+        self._lbl_resumen = ttk.Label(sec2, text="", style="Muted.TLabel", font=("Segoe UI", 9, "italic"))
+        self._lbl_resumen.pack(anchor="w", pady=(8, 0))
+
+        sec3 = ttk.Frame(main, padding=18, style="Card.TFrame")
+        sec3.pack(fill=tk.X, pady=(0, 14))
+
+        ttk.Label(sec3, text="💰  SMLMV por año (para cálculo de salarios)", style="SectionTitle.TLabel").pack(
+            anchor="w", pady=(0, 10)
+        )
+
+        smlmv_grid = ttk.Frame(sec3, style="Card.TFrame")
+        smlmv_grid.pack(fill=tk.X)
+
+        try:
+            from etl.config import SMLMV_POR_ANO
+
+            smlmv_base = dict(SMLMV_POR_ANO)
+        except Exception:
+            smlmv_base = {2023: 1_160_000, 2024: 1_300_000, 2025: 1_423_500}
+
+        cfg_smlmv = self._cfg.get("SMLMV_POR_ANO", {})
+        if isinstance(cfg_smlmv, dict):
+            for k, v in cfg_smlmv.items():
+                try:
+                    smlmv_base[int(k)] = int(v)
+                except (TypeError, ValueError):
+                    pass
+
+        años_smlmv = sorted(smlmv_base.keys())
+        for i, año in enumerate(años_smlmv):
+            row = i // 3
+            col = (i % 3) * 3
+            var = tk.StringVar(value=f"{smlmv_base[año]:,}".replace(",", "."))
+            self._smlmv_vars[año] = var
+
+            ttk.Label(smlmv_grid, text=f"{año}:", style="Muted.TLabel", width=6, anchor="e").grid(
+                row=row, column=col, padx=(8, 2), pady=2, sticky="e"
+            )
+            ttk.Entry(smlmv_grid, textvariable=var, width=12, font=("Segoe UI", 9)).grid(
+                row=row, column=col + 1, padx=(0, 8), pady=2, sticky="w"
+            )
+
+        ttk.Label(
+            sec3,
+            text="Formato: número sin puntos ni comas (ej. 1423500) o con puntos como miles (1.423.500).",
+            style="Light.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
+
+        btn_row = ttk.Frame(main, style="App.TFrame")
+        btn_row.pack(fill=tk.X, pady=(6, 0))
+
+        ttk.Button(btn_row, text="Cancelar", command=self.destroy, style="Secondary.TButton").pack(
+            side=tk.RIGHT, padx=(8, 0)
+        )
+
+        ttk.Button(btn_row, text="✅  Guardar y aplicar", command=self._guardar, style="Primary.TButton").pack(
+            side=tk.RIGHT
+        )
+
+    def _refresh_archivos(self) -> None:
+        try:
+            año = int(self._año_var.get())
+        except (ValueError, tk.TclError):
+            return
+
+        backup = self._get_ref_backup()
+        presentes = 0
+        total = len(self._ARCHIVOS_REQUERIDOS)
+
+        for tipo, patron in self._ARCHIVOS_REQUERIDOS.items():
+            nombre = patron.format(año=año)
+            candidatos = [
+                backup / nombre,
+                backup / "matriculas" / nombre,
+                backup / "matriculas primer curso" / nombre,
+                backup / "inscritos" / nombre,
+                backup / "graduados" / nombre,
+            ]
+            existe = any(c.exists() for c in candidatos)
+            if existe:
+                presentes += 1
+
+            lbl_nombre, lbl_estado = self._file_labels[tipo]
+            lbl_nombre.configure(text=nombre)
+            lbl_estado.configure(
+                text="✅" if existe else "❌",
+                foreground=EAFIT["success"] if existe else EAFIT["danger"],
+            )
+
+        if presentes == total:
+            resumen = f"✅ Todos los archivos de {año} están disponibles — puedes aplicar el cambio."
+            color = EAFIT["success"]
+        elif presentes == 0:
+            resumen = f"❌ No se encontró ningún archivo de {año} en ref/backup/."
+            color = EAFIT["danger"]
+        else:
+            resumen = (
+                f"⚠️ {presentes}/{total} archivos de {año} disponibles. "
+                "El pipeline usará NaN donde falten datos."
+            )
+            color = EAFIT["warning"]
+
+        self._lbl_resumen.configure(text=resumen, foreground=color)
+
+    def _guardar(self) -> None:
+        try:
+            año_nuevo = int(self._año_var.get())
+            if año_nuevo < 2019 or año_nuevo > 2035:
+                raise ValueError("Año fuera de rango")
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Error", "El año debe ser un número entre 2019 y 2035.", parent=self)
+            return
+
+        smlmv_nuevo: dict[int, int] = {}
+        for año_s, var in self._smlmv_vars.items():
+            try:
+                raw = str(var.get()).strip()
+                valor = int(raw.replace(".", "").replace(",", ""))
+                if valor > 0:
+                    smlmv_nuevo[año_s] = valor
+            except ValueError:
+                messagebox.showerror("Error", f"SMLMV {año_s}: valor inválido '{var.get()}'.", parent=self)
+                return
+
+        cfg = self._cargar_config()
+        cfg["AÑO_FIN_DATOS"] = año_nuevo
+        if smlmv_nuevo:
+            cfg["SMLMV_POR_ANO"] = {str(k): v for k, v in sorted(smlmv_nuevo.items())}
+
+        try:
+            self._guardar_config(cfg)
+            try:
+                from etl.config import reload_year_and_smlmv_from_config_file
+
+                reload_year_and_smlmv_from_config_file()
+            except Exception:
+                pass
+            messagebox.showinfo(
+                "Configuración guardada",
+                f"AÑO_FIN_DATOS = {año_nuevo}\n\n"
+                "Los valores de año y SMLMV quedaron activos en esta sesión. "
+                "Si algo no se refleja, reinicia la aplicación.",
+                parent=self,
+            )
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error al guardar", str(e), parent=self)
 
 
 class MainMenuGUI:
@@ -3478,6 +3761,11 @@ class MainMenuGUI:
                 "Abre el Excel más reciente Base_Programas_Categoria_F1_*.xlsx generado en la Fase 1 del indicador.",
             ),
             ("🎯 Reentrenar modelo", self._open_retrain, "Página para editar referentes y reentrenar el modelo de clasificación ML."),
+            (
+                "⚙️ Configuración",
+                self._open_configuracion,
+                "Ajusta el año de datos activo, verifica archivos disponibles y actualiza SMLMV.",
+            ),
         ]
         
         self._util_buttons = []
@@ -4138,6 +4426,13 @@ class MainMenuGUI:
         if not ensure_base_dir(self.root, prompt_if_missing=True):
             return
         self._show_page("mercado", MercadoPipelinePage)
+
+    def _open_configuracion(self) -> None:
+        """Abre el diálogo de configuración del sistema."""
+        dlg = ConfiguracionDialog(self.root)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        self.root.wait_window(dlg)
 
     def _open_logs(self):
         base = get_configured_base_dir()

@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from etl.config import (
+    AÑO_FIN_DATOS,
     OUTPUTS_DIR,
     REF_DIR,
     TEMP_DIR,
@@ -88,8 +89,9 @@ def _get_or_assign_prog_id(programas: list[str]) -> dict[str, str]:
 TASA_CAPTURA_EAFIT: float = 0.35
 
 # ANO_LANZAMIENTO sugerido por el sistema según urgencia de mercado.
-_ANO_LANZAMIENTO_URGENTE = 2026
-_ANO_LANZAMIENTO_NORMAL = 2027
+# Derivado de AÑO_FIN_DATOS: urgente = +2 años, normal = +3 años.
+_ANO_LANZAMIENTO_URGENTE: int = AÑO_FIN_DATOS + 2
+_ANO_LANZAMIENTO_NORMAL: int = AÑO_FIN_DATOS + 3
 
 # ── Definición de segmentos regionales (alineado con run_segmentos_regionales / nombres de parquet) ──
 COL_DEPT = "DEPARTAMENTO_OFERTA_PROGRAMA"
@@ -231,15 +233,15 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
     """
     VACIAS = {
         "CAT_ID": "",
-        "prom_matricula_por_programa_2024": 0.0,
-        "prom_matricula_2024": 0.0,
-        "participacion_2024": 0.0,
+        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": 0.0,
+        f"prom_matricula_{AÑO_FIN_DATOS}": 0.0,
+        f"participacion_{AÑO_FIN_DATOS}": 0.0,
         "AAGR_ROBUSTO": np.nan,
         "salario_promedio_smlmv": np.nan,
-        "pct_no_matriculados_2024": np.nan,
-        "num_programas_2024": 0,
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}": np.nan,
+        f"num_programas_{AÑO_FIN_DATOS}": 0,
         "distancia_costo_pct": np.nan,
-        "suma_matricula_2024": 0.0,
+        f"suma_matricula_{AÑO_FIN_DATOS}": 0.0,
         "programas_activos": 0,
         "programas_nuevos_3a": 0,
         "programas_inactivos": 0,
@@ -276,24 +278,24 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
                 return float(v) if pd.notna(v) else default
             return default
 
-        _pmp = _get("prom_matricula_por_programa_2024")
+        _pmp = _get(f"prom_matricula_por_programa_{AÑO_FIN_DATOS}")
         if not pd.notna(_pmp):
-            _pmp = _get("prom_primer_curso_2024")  # fallback explícito si la columna alias no existe
-        _pmp_val = _pmp if pd.notna(_pmp) else _get("prom_matricula_2024", 0.0)
+            _pmp = _get(f"prom_primer_curso_{AÑO_FIN_DATOS}")  # fallback explícito si la columna alias no existe
+        _pmp_val = _pmp if pd.notna(_pmp) else _get(f"prom_matricula_{AÑO_FIN_DATOS}", 0.0)
         _cat_id_cell = row["CAT_ID"] if "CAT_ID" in row.index else ""
         _cat_id = str(_cat_id_cell).strip() if pd.notna(_cat_id_cell) and str(_cat_id_cell).strip() else ""
         met = {
             "CAT_ID": _cat_id,
             # prom_matricula_por_programa_2024 es el nombre que scoring.py busca PRIMERO (= primer_curso)
-            "prom_matricula_por_programa_2024": _pmp_val,
-            "prom_matricula_2024": _pmp_val,  # mantener para compatibilidad con columnas Excel
-            "participacion_2024": _get("participacion_2024", 0.0),
+            f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": _pmp_val,
+            f"prom_matricula_{AÑO_FIN_DATOS}": _pmp_val,  # mantener para compatibilidad con columnas Excel
+            f"participacion_{AÑO_FIN_DATOS}": _get(f"participacion_{AÑO_FIN_DATOS}", 0.0),
             "AAGR_ROBUSTO": _get("AAGR_ROBUSTO"),
             "salario_promedio_smlmv": _get("salario_promedio_smlmv"),
-            "pct_no_matriculados_2024": _get("pct_no_matriculados_2024"),
-            "num_programas_2024": _get("num_programas_2024", 0.0),
+            f"pct_no_matriculados_{AÑO_FIN_DATOS}": _get(f"pct_no_matriculados_{AÑO_FIN_DATOS}"),
+            f"num_programas_{AÑO_FIN_DATOS}": _get(f"num_programas_{AÑO_FIN_DATOS}", 0.0),
             "distancia_costo_pct": _get("distancia_costo_pct"),
-            "suma_matricula_2024": _get("suma_matricula_2024", 0.0),
+            f"suma_matricula_{AÑO_FIN_DATOS}": _get(f"suma_matricula_{AÑO_FIN_DATOS}", 0.0),
             "programas_activos": _get("programas_activos", 0.0),
             "programas_nuevos_3a": _get("programas_nuevos_3a", 0.0),
             "programas_inactivos": _get("programas_inactivos", 0.0),
@@ -378,17 +380,17 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
     """
     if len(sub) == 0:
         return {
-            "prom_matricula_por_programa_2024": 0.0,
-            "prom_matricula_2024": 0.0,
-            "participacion_2024": 0.0,
+            f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": 0.0,
+            f"prom_matricula_{AÑO_FIN_DATOS}": 0.0,
+            f"participacion_{AÑO_FIN_DATOS}": 0.0,
             "AAGR_ROBUSTO": np.nan,
             "salario_promedio_smlmv": np.nan,
-            "pct_no_matriculados_2024": np.nan,
-            "num_programas_2024": 0,
+            f"pct_no_matriculados_{AÑO_FIN_DATOS}": np.nan,
+            f"num_programas_{AÑO_FIN_DATOS}": 0,
             "distancia_costo_pct": np.nan,
             # Extras para el Excel
-            "suma_primer_curso_2024": 0.0,
-            "suma_matricula_2024": 0,
+            f"suma_primer_curso_{AÑO_FIN_DATOS}": 0.0,
+            f"suma_matricula_{AÑO_FIN_DATOS}": 0,
             "programas_activos": 0,
             "programas_nuevos_3a": 0,
             "programas_inactivos": 0,
@@ -399,13 +401,13 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
     # Matrícula
     # Preferir primer_curso_2024 (flujo de nuevos) — mismo criterio que pipeline principal v4.2
     # Fallback a matricula_2024 si no existe la columna en la sábana
-    _pc_col = "primer_curso_2024" if "primer_curso_2024" in sub.columns else "matricula_2024"
+    _pc_col = f"primer_curso_{AÑO_FIN_DATOS}" if f"primer_curso_{AÑO_FIN_DATOS}" in sub.columns else f"matricula_{AÑO_FIN_DATOS}"
     prom_mat = float(sub[_pc_col].mean()) if _pc_col in sub.columns else 0.0
     suma_mat = float(sub[_pc_col].sum()) if _pc_col in sub.columns else 0.0
-    num_prog = int((sub["matricula_2024"] > 0).sum()) if "matricula_2024" in sub.columns else 0
+    num_prog = int((sub[f"matricula_{AÑO_FIN_DATOS}"] > 0).sum()) if f"matricula_{AÑO_FIN_DATOS}" in sub.columns else 0
 
     # Participación sobre primer_curso (flujo), no sobre stock total — igual que pipeline principal
-    _pc_col_reg = "primer_curso_2024" if "primer_curso_2024" in df_region_completo.columns else "matricula_2024"
+    _pc_col_reg = f"primer_curso_{AÑO_FIN_DATOS}" if f"primer_curso_{AÑO_FIN_DATOS}" in df_region_completo.columns else f"matricula_{AÑO_FIN_DATOS}"
     if _pc_col_reg in df_region_completo.columns and "CATEGORIA_FINAL" in df_region_completo.columns:
         todos_proms = df_region_completo.groupby("CATEGORIA_FINAL")[_pc_col_reg].mean()
         total_prom_sum = todos_proms.sum()
@@ -423,17 +425,17 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
     pct_no_mat = np.nan
     # Fórmula corregida v4.2: (inscritos - primer_curso) / inscritos
     # NO comparar vs matricula_total (genera negativos porque acumula cohortes previas)
-    _ins_col = next((c for c in ["inscritos_2024_suma", "inscritos_2024"] if c in sub.columns), None)
-    _pc_col_pct = next((c for c in ["primer_curso_2024"] if c in sub.columns), None)
+    _ins_col = next((c for c in [f"inscritos_{AÑO_FIN_DATOS}_suma", f"inscritos_{AÑO_FIN_DATOS}"] if c in sub.columns), None)
+    _pc_col_pct = next((c for c in [f"primer_curso_{AÑO_FIN_DATOS}"] if c in sub.columns), None)
     if _ins_col and _pc_col_pct:
         ins = float(sub[_ins_col].sum())
         pc = float(sub[_pc_col_pct].sum())
         if ins > 0:
             pct_no_mat = float(np.clip((ins - pc) / ins, 0.0, 1.0))
-        elif "pct_no_matriculados_2024" in sub.columns:
-            pct_no_mat = float(sub["pct_no_matriculados_2024"].mean())
-    elif "pct_no_matriculados_2024" in sub.columns:
-        pct_no_mat = float(sub["pct_no_matriculados_2024"].mean())
+        elif f"pct_no_matriculados_{AÑO_FIN_DATOS}" in sub.columns:
+            pct_no_mat = float(sub[f"pct_no_matriculados_{AÑO_FIN_DATOS}"].mean())
+    elif f"pct_no_matriculados_{AÑO_FIN_DATOS}" in sub.columns:
+        pct_no_mat = float(sub[f"pct_no_matriculados_{AÑO_FIN_DATOS}"].mean())
 
     # Programas activos / inactivos / nuevos
     prog_activos = int(sub["es_activo"].sum()) if "es_activo" in sub.columns else len(sub)
@@ -448,17 +450,17 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
     pct_con_mat = num_prog / prog_activos if prog_activos > 0 else 0.0
 
     return {
-        "prom_matricula_por_programa_2024": prom_mat,  # nombre primario para scoring.py
-        "prom_matricula_2024": prom_mat,  # alias para columnas Excel
-        "participacion_2024": participacion,
+        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": prom_mat,  # nombre primario para scoring.py
+        f"prom_matricula_{AÑO_FIN_DATOS}": prom_mat,  # alias para columnas Excel
+        f"participacion_{AÑO_FIN_DATOS}": participacion,
         "AAGR_ROBUSTO": aagr,
         "salario_promedio_smlmv": salario_smlmv,
-        "pct_no_matriculados_2024": pct_no_mat,
-        "num_programas_2024": num_prog,
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}": pct_no_mat,
+        f"num_programas_{AÑO_FIN_DATOS}": num_prog,
         "distancia_costo_pct": dist_costo,
         # Extras para mostrar en el Excel
-        "suma_primer_curso_2024": suma_mat,
-        "suma_matricula_2024": suma_mat,
+        f"suma_primer_curso_{AÑO_FIN_DATOS}": suma_mat,
+        f"suma_matricula_{AÑO_FIN_DATOS}": suma_mat,
         "programas_activos": prog_activos,
         "programas_nuevos_3a": prog_nuevos,
         "programas_inactivos": prog_inactivos,
@@ -472,20 +474,20 @@ def _score_y_calificacion(metricas: dict) -> dict:
     # Valor de scoring de matrícula: preferir prom_matricula_por_programa_2024 (= primer_curso)
     # que scoring.py busca primero. Fallback a prom_matricula_2024 si no está.
     _pmp_scoring = metricas.get(
-        "prom_matricula_por_programa_2024",
-        metricas.get("prom_matricula_2024", 0),
+        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}",
+        metricas.get(f"prom_matricula_{AÑO_FIN_DATOS}", 0),
     )
     df_tmp = pd.DataFrame(
         [
             {
-                "prom_matricula_por_programa_2024": _pmp_scoring,
-                "prom_matricula_2024": _pmp_scoring,
-                "participacion_2024": metricas.get("participacion_2024", 0),
+                f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": _pmp_scoring,
+                f"prom_matricula_{AÑO_FIN_DATOS}": _pmp_scoring,
+                f"participacion_{AÑO_FIN_DATOS}": metricas.get(f"participacion_{AÑO_FIN_DATOS}", 0),
                 "NIVEL_MAYORIT": metricas.get("NIVEL_MAYORIT", "ESPECIALIZACIÓN"),
                 "AAGR_ROBUSTO": metricas.get("AAGR_ROBUSTO", np.nan),
                 "salario_promedio_smlmv": metricas.get("salario_promedio_smlmv", np.nan),
-                "pct_no_matriculados_2024": metricas.get("pct_no_matriculados_2024", np.nan),
-                "num_programas_2024": metricas.get("num_programas_2024", 0),
+                f"pct_no_matriculados_{AÑO_FIN_DATOS}": metricas.get(f"pct_no_matriculados_{AÑO_FIN_DATOS}", np.nan),
+                f"num_programas_{AÑO_FIN_DATOS}": metricas.get(f"num_programas_{AÑO_FIN_DATOS}", 0),
                 "distancia_costo_pct": metricas.get("distancia_costo_pct", np.nan),
             }
         ]
@@ -636,7 +638,7 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
         cols_clave = [
             "CATEGORIA_FINAL",
             "AAGR_ROBUSTO",
-            "prom_matricula_2024",
+            f"prom_matricula_{AÑO_FIN_DATOS}",
             "calificacion_final",
             "salario_promedio_smlmv",
         ]
@@ -740,17 +742,17 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                     "TIENE_ESTUDIO_MERCADO": tiene_em,
                     "REGION": region,
                     # ── SECCIÓN MERCADO ──────────────────────────────────────
-                    "M_prom_matricula": met_m_s["prom_matricula_2024"],
+                    "M_prom_matricula": met_m_s[f"prom_matricula_{AÑO_FIN_DATOS}"],
                     "M_score_matricula": met_m_s["score_matricula"],
-                    "M_participacion": met_m_s["participacion_2024"],
+                    "M_participacion": met_m_s[f"participacion_{AÑO_FIN_DATOS}"],
                     "M_score_participacion": met_m_s["score_participacion"],
                     "M_AAGR": met_m_s["AAGR_ROBUSTO"],
                     "M_score_AAGR": met_m_s["score_AAGR"],
                     "M_salario_smlmv": met_m_s["salario_promedio_smlmv"],
                     "M_score_salario": met_m_s["score_salario"],
-                    "M_pct_no_matriculados": met_m_s["pct_no_matriculados_2024"],
+                    "M_pct_no_matriculados": met_m_s[f"pct_no_matriculados_{AÑO_FIN_DATOS}"],
                     "M_score_no_mat": met_m_s["score_pct_no_matriculados"],
-                    "M_num_programas": met_m_s["num_programas_2024"],
+                    "M_num_programas": met_m_s[f"num_programas_{AÑO_FIN_DATOS}"],
                     "M_score_num_programas": met_m_s["score_num_programas"],
                     "M_pct_con_matricula": met_m_s["pct_con_matricula"],
                     "M_programas_activos": met_m_s["programas_activos"],
@@ -760,17 +762,17 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                     "M_score_costo": met_m_s["score_costo"],
                     "M_calificacion": met_m_s["calificacion_final"],
                     # ── SECCIÓN REFERENTES ───────────────────────────────────
-                    "R_prom_matricula": met_r_s["prom_matricula_2024"],
+                    "R_prom_matricula": met_r_s[f"prom_matricula_{AÑO_FIN_DATOS}"],
                     "R_score_matricula": met_r_s["score_matricula"],
-                    "R_participacion": met_r_s["participacion_2024"],
+                    "R_participacion": met_r_s[f"participacion_{AÑO_FIN_DATOS}"],
                     "R_score_participacion": met_r_s["score_participacion"],
                     "R_AAGR": met_r_s["AAGR_ROBUSTO"],
                     "R_score_AAGR": met_r_s["score_AAGR"],
                     "R_salario_smlmv": met_r_s["salario_promedio_smlmv"],
                     "R_score_salario": met_r_s["score_salario"],
-                    "R_pct_no_matriculados": met_r_s["pct_no_matriculados_2024"],
+                    "R_pct_no_matriculados": met_r_s[f"pct_no_matriculados_{AÑO_FIN_DATOS}"],
                     "R_score_no_mat": met_r_s["score_pct_no_matriculados"],
-                    "R_num_programas": met_r_s["num_programas_2024"],
+                    "R_num_programas": met_r_s[f"num_programas_{AÑO_FIN_DATOS}"],
                     "R_score_num_programas": met_r_s["score_num_programas"],
                     "R_pct_con_matricula": met_r_s["pct_con_matricula"],
                     "R_programas_activos": met_r_s["programas_activos"],
@@ -792,10 +794,10 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                     "PROYECCION_ANUAL": max(
                         1,
                         round(
-                            float(met_r_s.get("prom_matricula_2024", 0) or 0)
+                            float(met_r_s.get(f"prom_matricula_{AÑO_FIN_DATOS}", 0) or 0)
                             * TASA_CAPTURA_EAFIT
                         ),
-                    ) if pd.notna(met_r_s.get("prom_matricula_2024")) else np.nan,
+                    ) if pd.notna(met_r_s.get(f"prom_matricula_{AÑO_FIN_DATOS}")) else np.nan,
                     "ANO_LANZAMIENTO": (
                         _ANO_LANZAMIENTO_URGENTE
                         if (
@@ -899,9 +901,9 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "PROGRAMA_EAFIT": "Programa EAFIT",
         "TIENE_ESTUDIO_MERCADO": "¿Tiene estudio?",
         "REGION": "Región",
-        "M_prom_matricula": "Prom. Primer Curso 2024",
+        "M_prom_matricula": f"Prom. Primer Curso {AÑO_FIN_DATOS}",
         "M_score_matricula": "Score",
-        "M_participacion": "Participación 2024",
+        "M_participacion": f"Participación {AÑO_FIN_DATOS}",
         "M_score_participacion": "Score",
         "M_AAGR": "AAGR Robusto",
         "M_score_AAGR": "Score",
@@ -918,9 +920,9 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "M_costo_promedio": "Costo Promedio",
         "M_score_costo": "Score",
         "M_calificacion": "CALIFICACIÓN",
-        "R_prom_matricula": "Prom. Primer Curso 2024",
+        "R_prom_matricula": f"Prom. Primer Curso {AÑO_FIN_DATOS}",
         "R_score_matricula": "Score",
-        "R_participacion": "Participación 2024",
+        "R_participacion": f"Participación {AÑO_FIN_DATOS}",
         "R_score_participacion": "Score",
         "R_AAGR": "AAGR Robusto",
         "R_score_AAGR": "Score",
