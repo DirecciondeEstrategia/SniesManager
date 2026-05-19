@@ -2157,18 +2157,18 @@ _BLOQUES_TOTAL = [
         f"var_prom_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
     ]),
     # ── 4. PARTICIPACIÓN Y CRECIMIENTO ────────────────────────────────────
+    # (var_yoy_* y diferencial_tendencia se calculan en agregación para SEÑAL_TENDENCIA; no se exportan)
     ("PARTICIPACIÓN Y CRECIMIENTO", [
-        "NIVEL_MAYORIT",                                    # universo dominante de la categoría
         f"participacion_{AÑO_INICIO_HISTORICO}", f"participacion_{AÑO_FIN_DATOS}",
         "AAGR_suma", "AAGR_prom", "CAGR_suma",
         "AAGR_ROBUSTO", "TIPO_CRECIMIENTO",
-        f"var_yoy_{AÑO_FIN_DATOS}", "diferencial_tendencia", "SEÑAL_TENDENCIA",
+        "SEÑAL_TENDENCIA",
     ]),
     # ── 5. DEMANDA NUEVA ───────────────────────────────────────────────────
     ("DEMANDA NUEVA",
         [f"suma_primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
         + [f"prom_primer_curso_{AÑO_INICIO_HISTORICO}", f"prom_primer_curso_{AÑO_FIN_DATOS}",
-           "AAGR_primer_curso", "tiene_primer_curso_real"],
+           "AAGR_primer_curso"],
     ),
     # ── 6. INSCRITOS ──────────────────────────────────────────────────────
     ("INSCRITOS", [
@@ -2183,8 +2183,6 @@ _BLOQUES_TOTAL = [
         # Variaciones
         "var_inscritos",
         "var_inscritos_prom",
-        # Flags de calidad
-        "tiene_inscritos_reales",
     ]),
     # ── 7. SALARIO (OLE) ──────────────────────────────────────────────────
     ("SALARIO", [
@@ -2203,18 +2201,13 @@ _BLOQUES_TOTAL = [
         "costo_promedio",
         "distancia_costo_pct",
     ]),
-    # ── 10. GRADUADOS ─────────────────────────────────────────────────────
-    ("GRADUADOS",
-        [f"graduados_{y}_suma" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
-        + ["tasa_graduacion"],
-    ),
-    # ── 11. MATRÍCULAS SEMESTRALES (dato granular, al fondo) ──────────────
+    # ── 10. MATRÍCULAS SEMESTRALES (dato granular, al fondo) ───────────────
     ("MATRÍCULAS SEMESTRALES", [
         f"suma_matricula_{y}_{s}"
         for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)
         for s in (1, 2)
     ]),
-    # ── 12. BLOQUE SCORING: valor | score lado a lado (igual que referente) ─
+    # ── 11. BLOQUE SCORING: valor | score lado a lado (igual que referente) ─
     ("SCORING", [
         f"prom_primer_curso_{AÑO_FIN_DATOS}",   "score_matricula",   # valor visible = primer_curso
         f"participacion_{AÑO_FIN_DATOS}", "score_participacion",
@@ -2224,10 +2217,9 @@ _BLOQUES_TOTAL = [
         f"num_programas_{AÑO_FIN_DATOS}", "score_num_programas",
         "costo_promedio", "score_costo",
     ]),
-    # ── 13. CALIFICACIÓN FINAL (extremo derecho, como en el referente) ────
+    # ── 12. CALIFICACIÓN FINAL (extremo derecho, como en el referente) ────
     ("CALIFICACIÓN", [
         "calificacion_final",
-        "FECHA_EJECUCION",
     ]),
 ]
 
@@ -4082,15 +4074,12 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
         "calificacion_final": 14,
         "AAGR_ROBUSTO": 13,
         f"suma_matricula_{AÑO_FIN_DATOS}": 16,
-        f"var_yoy_{AÑO_FIN_DATOS}": 13,
-        "diferencial_tendencia": 18,
         "SEÑAL_TENDENCIA": 20,
         "salario_promedio": 14,
         f"num_programas_{AÑO_FIN_DATOS}": 14,
         f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": 18,
         "costo_promedio": 14,
         "distancia_costo_pct": 15,
-        "tasa_graduacion": 14,
         "TIPO_CRECIMIENTO": 16,
     }
     for ci, col_name in enumerate(cols, start=1):
@@ -4135,7 +4124,6 @@ def _escribir_hoja_total(
         f"suma_matricula_{AÑO_INICIO_HISTORICO}": f"Matr. {AÑO_INICIO_HISTORICO}",
         "AAGR_suma": "AAGR Suma",
         "CAGR_suma": "CAGR Suma",
-        "tasa_graduacion": "Tasa Grad.",
         "salario_proyectado_pesos_hoy": "Salario (Pesos)",
         "costo_promedio": "Costo Prom.",
         f"num_programas_{AÑO_INICIO_HISTORICO}": f"N° Prog. {AÑO_INICIO_HISTORICO}",
@@ -4156,7 +4144,6 @@ def _escribir_hoja_total(
         "MATRÍCULAS ANUALES": "546E7A",
         "MATRÍCULAS SEMESTRALES": "78909C",
         "DEMANDA NUEVA": "2E7D32",
-        "GRADUADOS": "388E3C",
         "INSCRITOS": "E65100",
         "METADATA": "9E9E9E",
     }
@@ -4316,50 +4303,6 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
                     name="Arial",
                     size=10,
                 )
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            elif col_name == f"var_yoy_{AÑO_FIN_DATOS}":
-                cell.number_format = "0.0%"
-                # Color degradado según magnitud: rojo si cae, verde si sube fuerte
-                try:
-                    v = float(cell.value) if cell.value is not None else None
-                    if v is None:
-                        pass
-                    elif v >= 0.20:
-                        cell.fill = PatternFill("solid", fgColor="1F7A3C")
-                        from openpyxl.styles import Font as _Font
-                        cell.font = _Font(bold=True, color="FFFFFF", name="Arial", size=10)
-                    elif v >= 0.05:
-                        cell.fill = PatternFill("solid", fgColor="C6EFCE")
-                    elif v >= 0.00:
-                        cell.fill = PatternFill("solid", fgColor="FFFDE7")
-                    elif v >= -0.10:
-                        cell.fill = PatternFill("solid", fgColor="FFD9B3")
-                    else:
-                        cell.fill = PatternFill("solid", fgColor="FFC7CE")
-                        from openpyxl.styles import Font as _Font
-                        cell.font = _Font(bold=True, color="9C0006", name="Arial", size=10)
-                except (TypeError, ValueError):
-                    pass
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            elif col_name == "diferencial_tendencia":
-                cell.number_format = "0.0%"
-                # Rojo si diferencial muy negativo (mercado frenando), verde si positivo
-                try:
-                    v = float(cell.value) if cell.value is not None else None
-                    if v is None:
-                        pass
-                    elif v >= 0.05:
-                        cell.fill = PatternFill("solid", fgColor="C6EFCE")
-                    elif v >= -0.10:
-                        cell.fill = PatternFill("solid", fgColor="FFFDE7")
-                    elif v >= -0.25:
-                        cell.fill = PatternFill("solid", fgColor="FFD9B3")
-                    else:
-                        cell.fill = PatternFill("solid", fgColor="FFC7CE")
-                        from openpyxl.styles import Font as _Font
-                        cell.font = _Font(bold=True, color="9C0006", name="Arial", size=10)
-                except (TypeError, ValueError):
-                    pass
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
     ws.freeze_panes = "B3"
