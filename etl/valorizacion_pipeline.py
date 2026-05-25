@@ -832,6 +832,8 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
     ESTUDIO_MERCADO_DIR.mkdir(parents=True, exist_ok=True)
     ruta = ESTUDIO_MERCADO_DIR / "Programas_para_valorizacion_output.xlsx"
 
+    df_out = _reordenar_columnas_valorizacion(df_out)
+
     with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         df_out.to_excel(writer, sheet_name="Valorizacion", index=False)
         _formatear_hoja_valorizacion(writer, df_out)
@@ -840,15 +842,37 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
     return ruta
 
 
+def _reordenar_columnas_valorizacion(df_out: pd.DataFrame) -> pd.DataFrame:
+    """IDENTIFICACIÓN → CONCLUSIÓN → MERCADO → REFERENTES; SEMESTRE sin NaN."""
+    _cols_id = [
+        "PROG_ID", "CAT_ID", "CATEGORIA", "NIVEL",
+        "PROGRAMA_EAFIT", "TIENE_ESTUDIO_MERCADO", "REGION",
+    ]
+    _cols_concl = [
+        "VIABILIDAD_ESTUDIO", "CAL_INTEGRADA",
+        "ANO_LANZAMIENTO", "SEMESTRE_LANZAMIENTO", "PROYECCION_ANUAL",
+    ]
+    _cols_m = [c for c in df_out.columns if c.startswith("M_")]
+    _cols_r = [c for c in df_out.columns if c.startswith("R_")]
+    _orden = _cols_id + _cols_concl + _cols_m + _cols_r
+    df = df_out[[c for c in _orden if c in df_out.columns]].copy()
+    if "SEMESTRE_LANZAMIENTO" in df.columns:
+        df["SEMESTRE_LANZAMIENTO"] = df["SEMESTRE_LANZAMIENTO"].fillna("")
+    return df
+
+
 def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     """Formato visual: encabezados de dos niveles, colores por sección, scores con escala de color."""
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
     from openpyxl.comments import Comment
 
+    df_out = _reordenar_columnas_valorizacion(df_out)
+
     wb = writer.book
     ws = writer.sheets["Valorizacion"]
     cols = list(df_out.columns)
+    _cols_m = [c for c in cols if c.startswith("M_")]
 
     AZUL_EAFIT = "000066"
     AZUL_MERC = "00A9E0"
@@ -885,14 +909,18 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     # Insertar 2 filas de encabezado
     ws.insert_rows(1, 2)
 
-    N_ID = 7  # PROG_ID, CAT_ID, Categoría, Nivel, Programa, ¿Estudio?, Región
-    N_MET = 19  # columnas por sección (M_ y R_)
+    N_ID = 7  # PROG_ID, CAT_ID, Categoría, Nivel, Programa, ¿Tiene estudio?, Región
+    N_CONCL = 5  # VIABILIDAD, CAL_INTEGRADA, AÑO, SEMESTRE, PROYECCIÓN
+    N_MET = len(_cols_m)  # columnas M_ (dinámico, actualmente 19)
+
+    DORADO_CONCL = "7B5E00"  # dorado oscuro para sección conclusión
 
     # Fila 1: bloques de sección
     for c_ini, c_fin, titulo, color in [
         (1, N_ID, "IDENTIFICACIÓN", AZUL_EAFIT),
-        (N_ID + 1, N_ID + N_MET, "MERCADO", AZUL_MERC),
-        (N_ID + N_MET + 1, len(cols), "REFERENTES", VERDE_REF),
+        (N_ID + 1, N_ID + N_CONCL, "CONCLUSIÓN", DORADO_CONCL),
+        (N_ID + N_CONCL + 1, N_ID + N_CONCL + N_MET, "MERCADO", AZUL_MERC),
+        (N_ID + N_CONCL + N_MET + 1, len(cols), "REFERENTES", VERDE_REF),
     ]:
         ws.merge_cells(start_row=1, start_column=c_ini, end_row=1, end_column=c_fin)
         cell = ws.cell(row=1, column=c_ini)
@@ -959,7 +987,14 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     for ci, col in enumerate(cols, 1):
         cell = ws.cell(row=2, column=ci)
         cell.value = NOMBRES.get(col, col)
-        cell.fill = fill(AZUL_EAFIT if ci <= N_ID else (AZUL_MERC if ci <= N_ID + N_MET else VERDE_REF))
+        if ci <= N_ID:
+            cell.fill = fill(AZUL_EAFIT)
+        elif ci <= N_ID + N_CONCL:
+            cell.fill = fill(DORADO_CONCL)
+        elif ci <= N_ID + N_CONCL + N_MET:
+            cell.fill = fill(AZUL_MERC)
+        else:
+            cell.fill = fill(VERDE_REF)
         cell.font = font(BLANCO, bold=True, size=9)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = borde
@@ -988,6 +1023,8 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         or c in ("PROYECCION_ANUAL", "ANO_LANZAMIENTO")
     }
     cost_cols = {ci for ci, c in enumerate(cols, 1) if "costo_promedio" in c}
+    prom_cols = {ci for ci, c in enumerate(cols, 1) if "prom_matricula" in c}
+    sal_cols = {ci for ci, c in enumerate(cols, 1) if "salario_smlmv" in c}
 
     # Formato de filas de datos
     for ri in range(3, 3 + len(df_out)):
@@ -1000,6 +1037,26 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
             if ci in score_cols_m or ci in score_cols_r:
                 cell.fill = score_fill(cell.value)
                 cell.font = score_font(cell.value)
+
+            elif col == "VIABILIDAD_ESTUDIO":
+                viab_colores = {
+                    "ALTA": "C6EFCE",
+                    "MEDIA": "FFFDE7",
+                    "BAJA": "FFD9B3",
+                    "MUY_BAJA": "FFC7CE",
+                }
+                viab_texto = {
+                    "ALTA": "1A6B2B",
+                    "MEDIA": "7D6608",
+                    "BAJA": "8A3A00",
+                    "MUY_BAJA": "9C0006",
+                }
+                val_v = str(cell.value).strip().upper() if cell.value else ""
+                bg = viab_colores.get(val_v, "F2F2F2")
+                fg = viab_texto.get(val_v, "1A1A1A")
+                cell.fill = PatternFill("solid", fgColor=bg)
+                cell.font = Font(bold=True, color=fg, name="Arial", size=10)
+                continue
 
             elif col == "CAL_INTEGRADA":
                 try:
@@ -1026,6 +1083,11 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
                 cell.font = Font(name="Arial", size=9)
                 cell.alignment = Alignment(horizontal="left", vertical="center")
 
+            elif ci <= N_ID + N_CONCL:
+                if col not in ("VIABILIDAD_ESTUDIO", "CAL_INTEGRADA"):
+                    cell.fill = fill("FFFDF0" if alt else "FFFFF8")
+                    cell.font = Font(bold=False, name="Arial", size=9)
+
             else:
                 cell.fill = fill(GRIS_ALT if alt else BLANCO)
                 cell.font = Font(name="Arial", size=9)
@@ -1035,6 +1097,10 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
                     cell.number_format = "#,##0"
                 elif ci in int_cols:
                     cell.number_format = "#,##0"
+                elif ci in prom_cols:
+                    cell.number_format = "0.0"
+                elif ci in sal_cols:
+                    cell.number_format = "0.00"
 
     # Anchos
     ANCHOS = {

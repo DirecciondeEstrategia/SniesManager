@@ -3397,6 +3397,464 @@ class ConfiguracionDialog(tk.Toplevel):
             messagebox.showerror("Error al guardar", str(e), parent=self)
 
 
+class GestionProgramasDialog(tk.Toplevel):
+    """
+    Diálogo para gestionar programas candidatos en el análisis de valorización.
+    Edita ref/backup/programas_para_valorizacion.xlsx directamente.
+    """
+
+    _COL_CATEGORIA = "Categoría"
+    _COL_NIVEL = "Nivel"
+    _COL_PROGRAMA = "Programas en proceso Calidad académica "
+    _COL_ESTUDIO = "Tiene estudio de mercado "
+    _COL_REGION = "Región"
+    _REGIONES = ["Antioquia", "Bogota", "Eje Cafetero", "Virtual"]
+    _SHEET = "Hoja1"
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("➕ Añadir programas")
+        self.resizable(True, True)
+        self.configure(bg=EAFIT["bg"])
+
+        w, h = 760, 680
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(640, 520)
+
+        self._ruta = self._encontrar_archivo()
+        self._df = self._cargar()
+        self._modificado = False
+
+        self._build_ui()
+        self._refrescar_tabla()
+
+    @staticmethod
+    def _encontrar_archivo() -> Path:
+        from etl.config import REF_DIR
+
+        candidatos = [
+            REF_DIR / "backup" / "programas_para_valorizacion.xlsx",
+            REF_DIR / "programas_para_valorizacion.xlsx",
+        ]
+        for p in candidatos:
+            if p.exists():
+                return p
+        return candidatos[0]
+
+    def _cargar(self) -> pd.DataFrame:
+        cols_df = [self._COL_CATEGORIA, self._COL_NIVEL, self._COL_PROGRAMA, self._COL_ESTUDIO]
+        if not self._ruta.exists():
+            return pd.DataFrame(columns=cols_df)
+
+        try:
+            df = pd.read_excel(self._ruta, header=1, usecols=range(5))
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo leer el archivo:\n{e}", parent=self)
+            return pd.DataFrame(columns=cols_df)
+
+        rename: dict[str, str] = {}
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if "categor" in cl:
+                rename[c] = self._COL_CATEGORIA
+            elif cl == "nivel" or "nivel" in cl:
+                rename[c] = self._COL_NIVEL
+            elif "proceso" in cl or "calidad" in cl or (
+                "programa" in cl and "eafit" not in cl
+            ):
+                rename[c] = self._COL_PROGRAMA
+            elif "estudio" in cl or "mercado" in cl:
+                rename[c] = self._COL_ESTUDIO
+            elif "regi" in cl:
+                rename[c] = self._COL_REGION
+        df = df.rename(columns=rename)
+
+        for col in cols_df:
+            if col not in df.columns:
+                df[col] = "" if col != self._COL_ESTUDIO else "No"
+
+        df[self._COL_PROGRAMA] = df[self._COL_PROGRAMA].astype(str).str.strip()
+        df = df[df[self._COL_PROGRAMA].astype(str).str.len() > 0]
+        df = df.drop_duplicates(subset=[self._COL_PROGRAMA], keep="first").reset_index(drop=True)
+        return df[cols_df]
+
+    def _guardar(self) -> bool:
+        try:
+            self._ruta.parent.mkdir(parents=True, exist_ok=True)
+            filas: list[dict[str, str]] = []
+            for _, row in self._df.iterrows():
+                for reg in self._REGIONES:
+                    filas.append(
+                        {
+                            self._COL_CATEGORIA: str(row.get(self._COL_CATEGORIA, "") or "").strip(),
+                            self._COL_NIVEL: str(row.get(self._COL_NIVEL, "") or "").strip(),
+                            self._COL_PROGRAMA: str(row[self._COL_PROGRAMA]).strip(),
+                            self._COL_ESTUDIO: str(row.get(self._COL_ESTUDIO, "No") or "No").strip(),
+                            self._COL_REGION: reg,
+                        }
+                    )
+            df_save = pd.DataFrame(filas)
+            hdr = [
+                self._COL_CATEGORIA,
+                self._COL_NIVEL,
+                self._COL_PROGRAMA,
+                self._COL_ESTUDIO,
+                self._COL_REGION,
+            ]
+            df_save = df_save[hdr]
+
+            with pd.ExcelWriter(self._ruta, engine="openpyxl") as writer:
+                pd.DataFrame([[None] * len(hdr)]).to_excel(
+                    writer, sheet_name=self._SHEET, index=False, header=False
+                )
+                df_save.to_excel(writer, sheet_name=self._SHEET, index=False, startrow=1)
+
+            self._modificado = False
+            return True
+        except PermissionError:
+            messagebox.showerror(
+                "Archivo abierto",
+                "No se pudo guardar porque el archivo está abierto en Excel.\n"
+                "Ciérralo y vuelve a intentar.",
+                parent=self,
+            )
+            return False
+        except Exception as e:
+            messagebox.showerror("Error al guardar", str(e), parent=self)
+            return False
+
+    def _build_ui(self) -> None:
+        main = ttk.Frame(self, padding=20, style="App.TFrame")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main, text="Añadir programas a valorizar", style="Header.TLabel").pack(
+            anchor="w"
+        )
+        ttk.Label(
+            main,
+            text="Lista de candidatos que EAFIT evalúa abrir. Se usan en la Fase 7 (Valorización).",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 14))
+
+        tabla_frame = ttk.Frame(main, style="Card.TFrame", padding=12)
+        tabla_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(tabla_frame, text="Programas actuales", style="SectionTitle.TLabel").pack(
+            anchor="w", pady=(0, 6)
+        )
+
+        tree_frame = ttk.Frame(tabla_frame, style="Card.TFrame")
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._tree = ttk.Treeview(
+            tree_frame,
+            columns=("programa", "categoria", "nivel", "estudio"),
+            show="headings",
+            height=12,
+            selectmode="browse",
+        )
+        self._tree.heading("programa", text="Nombre del Programa")
+        self._tree.heading("categoria", text="Categoría")
+        self._tree.heading("nivel", text="Nivel")
+        self._tree.heading("estudio", text="¿Tiene estudio?")
+        self._tree.column("programa", width=300, anchor="w")
+        self._tree.column("categoria", width=180, anchor="w")
+        self._tree.column("nivel", width=110, anchor="w")
+        self._tree.column("estudio", width=90, anchor="center")
+
+        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=sb.set)
+        self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Button(
+            tabla_frame,
+            text="🗑 Eliminar seleccionado",
+            command=self._eliminar_seleccionado,
+            style="Secondary.TButton",
+        ).pack(anchor="e", pady=(8, 0))
+
+        add_frame = ttk.Frame(main, padding=(12, 10, 12, 0), style="Card.TFrame")
+        add_frame.pack(fill=tk.X, pady=(14, 0))
+
+        ttk.Label(add_frame, text="Añadir programa candidato", style="SectionTitle.TLabel").pack(
+            anchor="w", pady=(0, 8)
+        )
+
+        campos = ttk.Frame(add_frame, style="Card.TFrame")
+        campos.pack(fill=tk.X)
+
+        ttk.Label(campos, text="Nombre del programa:", style="Body.TLabel", width=22).grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        self._entry_nombre = ttk.Entry(campos, font=("Segoe UI", 10), width=46)
+        self._entry_nombre.grid(row=0, column=1, sticky="ew", pady=4)
+
+        ttk.Label(campos, text="Categoría de mercado:", style="Body.TLabel", width=22).grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        self._entry_categoria = ttk.Entry(campos, font=("Segoe UI", 10), width=46)
+        self._entry_categoria.grid(row=1, column=1, sticky="ew", pady=4)
+
+        ttk.Label(campos, text="Nivel:", style="Body.TLabel", width=22).grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        self._nivel_var = tk.StringVar(value="Maestría")
+        nivel_cb = ttk.Combobox(
+            campos,
+            textvariable=self._nivel_var,
+            values=["Especialización", "Maestría", "Doctorado", "Universitario"],
+            state="readonly",
+            width=20,
+        )
+        nivel_cb.grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(campos, text="¿Tiene estudio?:", style="Body.TLabel", width=22).grid(
+            row=3, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        estudio_frame = ttk.Frame(campos, style="Card.TFrame")
+        estudio_frame.grid(row=3, column=1, sticky="w", pady=4)
+        self._estudio_var = tk.StringVar(value="No")
+        ttk.Radiobutton(estudio_frame, text="Sí", variable=self._estudio_var, value="Si").pack(
+            side=tk.LEFT
+        )
+        ttk.Radiobutton(estudio_frame, text="No", variable=self._estudio_var, value="No").pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
+        campos.columnconfigure(1, weight=1)
+
+        add_btn_row = ttk.Frame(add_frame, style="Card.TFrame")
+        add_btn_row.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Button(
+            add_btn_row,
+            text="➕ Añadir a la lista",
+            command=self._añadir_programa,
+            style="Primary.TButton",
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            add_btn_row,
+            text="📂 Importar desde Excel...",
+            command=self._importar_excel,
+            style="Secondary.TButton",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(
+            add_btn_row,
+            text="El Excel de importación debe tener una columna con los nombres.",
+            style="Muted.TLabel",
+            font=("Segoe UI", 8),
+        ).pack(side=tk.LEFT, padx=(14, 0))
+
+        btn_row = ttk.Frame(main, style="App.TFrame")
+        btn_row.pack(fill=tk.X, pady=(16, 0))
+
+        self._lbl_estado = ttk.Label(btn_row, text="", style="Muted.TLabel", font=("Segoe UI", 9))
+        self._lbl_estado.pack(side=tk.LEFT)
+
+        ttk.Button(
+            btn_row,
+            text="Cancelar",
+            command=self._confirmar_cierre,
+            style="Secondary.TButton",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+
+        ttk.Button(
+            btn_row,
+            text="💾  Guardar cambios",
+            command=self._guardar_y_cerrar,
+            style="Primary.TButton",
+        ).pack(side=tk.RIGHT)
+
+        self.protocol("WM_DELETE_WINDOW", self._confirmar_cierre)
+
+    def _refrescar_tabla(self) -> None:
+        self._tree.delete(*self._tree.get_children())
+        for _, row in self._df.iterrows():
+            self._tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row[self._COL_PROGRAMA],
+                    row.get(self._COL_CATEGORIA, ""),
+                    row.get(self._COL_NIVEL, ""),
+                    row.get(self._COL_ESTUDIO, ""),
+                ),
+            )
+        n = len(self._df)
+        estado = f"{n} programa{'s' if n != 1 else ''} en la lista"
+        if self._modificado:
+            estado += "  ·  ⚠️ Cambios sin guardar"
+        self._lbl_estado.configure(text=estado)
+
+    def _añadir_programa(self) -> None:
+        nombre = self._entry_nombre.get().strip()
+        if not nombre:
+            messagebox.showwarning("Campo vacío", "Escribe el nombre del programa.", parent=self)
+            return
+
+        categoria = self._entry_categoria.get().strip()
+        if not categoria:
+            messagebox.showwarning(
+                "Campo vacío",
+                "Indica la categoría de mercado (ej. ANALITICA DE DATOS).",
+                parent=self,
+            )
+            return
+
+        nombres_norm = self._df[self._COL_PROGRAMA].astype(str).str.strip().str.lower()
+        if nombre.lower() in nombres_norm.values:
+            messagebox.showinfo("Duplicado", f'"{nombre}" ya está en la lista.', parent=self)
+            return
+
+        nueva_fila = pd.DataFrame(
+            [
+                {
+                    self._COL_CATEGORIA: categoria,
+                    self._COL_NIVEL: self._nivel_var.get().strip(),
+                    self._COL_PROGRAMA: nombre,
+                    self._COL_ESTUDIO: self._estudio_var.get(),
+                }
+            ]
+        )
+        self._df = pd.concat([self._df, nueva_fila], ignore_index=True)
+        self._modificado = True
+        self._entry_nombre.delete(0, tk.END)
+        self._entry_categoria.delete(0, tk.END)
+        self._refrescar_tabla()
+
+    def _eliminar_seleccionado(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        nombre = self._tree.item(sel[0], "values")[0]
+        if not messagebox.askyesno(
+            "Confirmar", f'¿Eliminar "{nombre}" de la lista?', parent=self
+        ):
+            return
+        mask = self._df[self._COL_PROGRAMA].astype(str) != nombre
+        self._df = self._df.loc[mask].reset_index(drop=True)
+        self._modificado = True
+        self._refrescar_tabla()
+
+    def _importar_excel(self) -> None:
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar Excel con programas candidatos",
+            filetypes=[("Excel", "*.xlsx *.xls"), ("Todos", "*.*")],
+            parent=self,
+        )
+        if not ruta:
+            return
+        try:
+            df_imp = pd.read_excel(ruta)
+        except Exception as e:
+            messagebox.showerror("Error al leer", str(e), parent=self)
+            return
+
+        col_prog = None
+        for c in df_imp.columns:
+            cl = str(c).strip().lower()
+            if any(k in cl for k in ("programa", "nombre", "proceso", "calidad")):
+                col_prog = c
+                break
+        if col_prog is None:
+            col_prog = df_imp.columns[0]
+
+        col_cat = None
+        for c in df_imp.columns:
+            cl = str(c).strip().lower()
+            if "categor" in cl:
+                col_cat = c
+                break
+
+        col_niv = None
+        for c in df_imp.columns:
+            cl = str(c).strip().lower()
+            if cl == "nivel" or cl.startswith("nivel"):
+                col_niv = c
+                break
+
+        col_est = None
+        for c in df_imp.columns:
+            cl = str(c).strip().lower()
+            if "estudio" in cl or "mercado" in cl:
+                col_est = c
+                break
+
+        nombres_actuales = set(
+            self._df[self._COL_PROGRAMA].astype(str).str.strip().str.lower()
+        )
+        nuevos: list[dict[str, str]] = []
+        duplicados = 0
+        for _, row in df_imp.iterrows():
+            nombre = str(row[col_prog]).strip()
+            if not nombre or nombre.lower() == "nan":
+                continue
+            if nombre.lower() in nombres_actuales:
+                duplicados += 1
+                continue
+            estudio = str(row[col_est]).strip() if col_est else "No"
+            if estudio.lower() not in ("si", "sí", "yes", "true", "1"):
+                estudio = "No"
+            else:
+                estudio = "Si"
+            cat = str(row[col_cat]).strip() if col_cat and pd.notna(row.get(col_cat)) else ""
+            niv = (
+                str(row[col_niv]).strip()
+                if col_niv and pd.notna(row.get(col_niv))
+                else "Maestría"
+            )
+            nuevos.append(
+                {
+                    self._COL_CATEGORIA: cat,
+                    self._COL_NIVEL: niv,
+                    self._COL_PROGRAMA: nombre,
+                    self._COL_ESTUDIO: estudio,
+                }
+            )
+            nombres_actuales.add(nombre.lower())
+
+        if not nuevos:
+            msg = "No se encontraron programas nuevos."
+            if duplicados:
+                msg += f"\n{duplicados} ya estaban en la lista."
+            messagebox.showinfo("Importación", msg, parent=self)
+            return
+
+        self._df = pd.concat([self._df, pd.DataFrame(nuevos)], ignore_index=True)
+        self._modificado = True
+        self._refrescar_tabla()
+
+        msg = f"✅ {len(nuevos)} programa(s) importado(s)."
+        if duplicados:
+            msg += f"\n{duplicados} omitido(s) por duplicado."
+        messagebox.showinfo("Importación completada", msg, parent=self)
+
+    def _guardar_y_cerrar(self) -> None:
+        if self._guardar():
+            messagebox.showinfo(
+                "Guardado",
+                f"Lista guardada con {len(self._df)} programas.\n"
+                "Los cambios se aplicarán en la próxima ejecución de la Fase 7.",
+                parent=self,
+            )
+            self.destroy()
+
+    def _confirmar_cierre(self) -> None:
+        if self._modificado:
+            if messagebox.askyesno(
+                "Cambios sin guardar",
+                "Hay cambios sin guardar. ¿Cerrar de todas formas?",
+                parent=self,
+            ):
+                self.destroy()
+        else:
+            self.destroy()
+
+
 class MainMenuGUI:
     """Menú principal del sistema."""
 
@@ -3759,6 +4217,11 @@ class MainMenuGUI:
                 "📊 Revisar programas y categorías",
                 self._open_base_programas_categorias,
                 "Abre el Excel más reciente Base_Programas_Categoria_F1_*.xlsx generado en la Fase 1 del indicador.",
+            ),
+            (
+                "➕ Añadir programas",
+                self._open_gestion_programas,
+                "Agrega o edita los programas candidatos que se analizan en la Fase 7 (Valorización).",
             ),
             ("🎯 Reentrenar modelo", self._open_retrain, "Página para editar referentes y reentrenar el modelo de clasificación ML."),
             (
@@ -4430,6 +4893,12 @@ class MainMenuGUI:
     def _open_configuracion(self) -> None:
         """Abre el diálogo de configuración del sistema."""
         dlg = ConfiguracionDialog(self.root)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+
+    def _open_gestion_programas(self) -> None:
+        dlg = GestionProgramasDialog(self.root)
         dlg.transient(self.root)
         dlg.grab_set()
         self.root.wait_window(dlg)

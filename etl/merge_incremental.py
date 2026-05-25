@@ -6,7 +6,8 @@ Reglas:
   - Programas nuevos (en Programas.xlsx pero no en Excel): se agregan.
   - Programas comunes: se actualizan columnas calculadas; se respetan manuales.
   - Programas desaparecidos (en Excel pero no en Programas.xlsx): ACTIVO_PIPELINE=False.
-  - Antes de modificar, guarda snapshot con fecha en outputs/historico/snapshots/.
+  - Antes de modificar, guarda snapshot con fecha en historico_estudio_de_mercado/snapshots/
+    (Estudio_Mercado_Colombia.xlsx y Base_Programas_Categoria_F1_*.xlsx).
 """
 
 from __future__ import annotations
@@ -18,12 +19,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from etl.config import ARCHIVO_ESTUDIO_MERCADO, HISTORICO_ESTUDIO_MERCADO_DIR
+from etl.config import ARCHIVO_ESTUDIO_MERCADO, ESTUDIO_MERCADO_DIR, HISTORICO_ESTUDIO_MERCADO_DIR
 from etl.pipeline_logger import log_info, log_warning
 
 # ── Rutas ─────────────────────────────────────────────────────────────────────
 SNAPSHOTS_DIR = HISTORICO_ESTUDIO_MERCADO_DIR / "snapshots"
 ESTUDIO_PATH = ARCHIVO_ESTUDIO_MERCADO
+BASE_PROGRAMAS_GLOB = "Base_Programas_Categoria_F1_*.xlsx"
 
 # Número de días que se conservan los snapshots. Snapshots más viejos se eliminan.
 SNAPSHOT_RETENTION_DAYS = 365
@@ -90,24 +92,41 @@ COLS_DESCRIPTIVAS_SNIES = [
 
 def _guardar_snapshot(path: Path) -> None:
     """
-    Copia el Excel actual a outputs/historico/snapshots/ con fecha en el nombre.
+    Copia el estudio actual y los Excel Base_Programas F1 a historico/snapshots/.
     Luego elimina snapshots con más de SNAPSHOT_RETENTION_DAYS días de antigüedad.
     """
-    if not path.exists():
-        return
-
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Guardar snapshot actual
     fecha = date.today().isoformat()
-    dest = SNAPSHOTS_DIR / f"Estudio_Mercado_{fecha}.xlsx"
-    if dest.exists():
-        hora = datetime.now().strftime("%H%M")
-        dest = SNAPSHOTS_DIR / f"Estudio_Mercado_{fecha}_{hora}.xlsx"
-    shutil.copy2(path, dest)
-    log_info(f"[Merge] Snapshot guardado: {dest.name}")
+    hora: str | None = None
 
-    # Limpiar snapshots antiguos
+    def _destino_unico(nombre: str) -> Path:
+        nonlocal hora
+        dest = SNAPSHOTS_DIR / nombre
+        if dest.exists():
+            if hora is None:
+                hora = datetime.now().strftime("%H%M")
+            stem, suffix = dest.stem, dest.suffix
+            dest = SNAPSHOTS_DIR / f"{stem}_{hora}{suffix}"
+        return dest
+
+    # Estudio_Mercado_Colombia.xlsx
+    if path.exists():
+        dest = _destino_unico(f"Estudio_Mercado_{fecha}.xlsx")
+        shutil.copy2(path, dest)
+        log_info(f"[Merge] Snapshot guardado: {dest.name}")
+
+    # Base_Programas_Categoria_F1_*.xlsx (export Fase 1 en estudio_de_mercado/)
+    n_base = 0
+    for src in sorted(ESTUDIO_MERCADO_DIR.glob(BASE_PROGRAMAS_GLOB)):
+        dest = _destino_unico(src.name)
+        shutil.copy2(src, dest)
+        log_info(f"[Merge] Snapshot Base F1: {dest.name}")
+        n_base += 1
+    if n_base == 0:
+        log_info("[Merge] No hay archivos Base_Programas_Categoria_F1_*.xlsx para archivar.")
+    else:
+        log_info(f"[Merge] {n_base} archivo(s) Base_Programas archivados en snapshots/.")
+
     _limpiar_snapshots_antiguos()
 
 
@@ -120,15 +139,16 @@ def _limpiar_snapshots_antiguos() -> None:
     eliminados = 0
     errores = 0
 
-    for f in SNAPSHOTS_DIR.glob("Estudio_Mercado_*.xlsx"):
-        try:
-            edad_dias = (hoy - date.fromtimestamp(f.stat().st_mtime)).days
-            if edad_dias > SNAPSHOT_RETENTION_DAYS:
-                f.unlink()
-                eliminados += 1
-        except Exception as e:
-            log_warning(f"[Merge] No se pudo eliminar snapshot {f.name}: {e}")
-            errores += 1
+    for patron in ("Estudio_Mercado_*.xlsx", BASE_PROGRAMAS_GLOB):
+        for f in SNAPSHOTS_DIR.glob(patron):
+            try:
+                edad_dias = (hoy - date.fromtimestamp(f.stat().st_mtime)).days
+                if edad_dias > SNAPSHOT_RETENTION_DAYS:
+                    f.unlink()
+                    eliminados += 1
+            except Exception as e:
+                log_warning(f"[Merge] No se pudo eliminar snapshot {f.name}: {e}")
+                errores += 1
 
     if eliminados > 0:
         log_info(
