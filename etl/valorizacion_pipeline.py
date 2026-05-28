@@ -11,6 +11,8 @@ Lista de programas: ref/backup/programas_para_valorizacion.xlsx
 
 from __future__ import annotations
 
+import re as _re
+import unicodedata as _ud
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
@@ -20,6 +22,7 @@ import pandas as pd
 
 from etl.config import (
     AÑO_FIN_DATOS,
+    AÑO_INICIO_PRIMER_CURSO,
     OUTPUTS_DIR,
     REF_DIR,
     TEMP_DIR,
@@ -28,9 +31,21 @@ from etl.config import (
     NIVELES_MERCADO,
 )
 from etl.pipeline_logger import log_info, log_warning
-from etl.scoring import apply_scoring
+from etl.scoring import _SCORE_PARTICIPACION_PESO, apply_scoring
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 _PROG_IDS_PATH = REF_DIR / "backup" / "prog_ids.csv"
+_CAT_IDS_PATH = REF_DIR / "backup" / "cat_ids.csv"
+
+# Lazy: TF-IDF sobre categorías canónicas (cat_ids.csv)
+_CATS_VECTORIZER: TfidfVectorizer | None = None
+_CATS_MATRIX = None
+_CATS_CANONICAS: list[str] | None = None
+
+# Lazy: CAT_ID por CATEGORIA_FINAL (cat_ids.csv)
+_CAT_IDS_MAP: dict[str, str] | None = None
+_CAT_IDS_NORM_MAP: dict[str, str] | None = None
 # Rango reservado EAFIT: 900001-900999.
 _PROG_ID_BASE = 900001
 
@@ -198,7 +213,7 @@ def _leer_programas_eafit(log: Callable) -> pd.DataFrame:
 
     df = (
         df.dropna(subset=["PROGRAMA_EAFIT"])
-        .drop_duplicates(subset=["PROGRAMA_EAFIT"])
+        .drop_duplicates(subset=["PROGRAMA_EAFIT", "CATEGORIA_RAW"])
         .reset_index(drop=True)
     )
     log(f"  Programas EAFIT a valorizar: {len(df)}")
@@ -287,7 +302,7 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
         _pmp = _get(f"prom_matricula_por_programa_{AÑO_FIN_DATOS}")
         if not pd.notna(_pmp):
             _pmp = _get(f"prom_primer_curso_{AÑO_FIN_DATOS}")  # fallback explícito si la columna alias no existe
-        _pmp_val = _pmp if pd.notna(_pmp) else _get(f"prom_matricula_{AÑO_FIN_DATOS}", 0.0)
+        _pmp_val = _pmp if pd.notna(_pmp) else 0.0
         _cat_id_cell = row["CAT_ID"] if "CAT_ID" in row.index else ""
         _cat_id = str(_cat_id_cell).strip() if pd.notna(_cat_id_cell) and str(_cat_id_cell).strip() else ""
         met = {
@@ -352,6 +367,315 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
     return prom
 
 
+def _norm_cat(s: str) -> str:
+    """Normaliza una cadena de categoría para comparación:
+    mayúsculas, sin tildes, espacios colapsados."""
+    s = str(s).strip().upper()
+    s = _ud.normalize("NFD", s)
+    s = "".join(c for c in s if _ud.category(c) != "Mn")
+    return _re.sub(r"\s+", " ", s).strip()
+
+
+def _ensure_cats_vectorizer() -> bool:
+    """Construye vectorizador TF-IDF char_wb sobre CATEGORIA_FINAL de cat_ids.csv."""
+    global _CATS_VECTORIZER, _CATS_MATRIX, _CATS_CANONICAS
+    if _CATS_MATRIX is not None:
+        return True
+    if not _CAT_IDS_PATH.exists():
+        return False
+    try:
+        df = pd.read_csv(_CAT_IDS_PATH, dtype=str)
+        if "CATEGORIA_FINAL" not in df.columns:
+            return False
+        _CATS_CANONICAS = (
+            df["CATEGORIA_FINAL"].dropna().astype(str).str.strip().tolist()
+        )
+        if not _CATS_CANONICAS:
+            return False
+        _CATS_VECTORIZER = TfidfVectorizer(
+            ngram_range=(1, 3),
+            max_features=50_000,
+            sublinear_tf=True,
+            analyzer="char_wb",
+            min_df=1,
+            strip_accents="unicode",
+        )
+        _CATS_MATRIX = _CATS_VECTORIZER.fit_transform(_CATS_CANONICAS)
+        return True
+    except Exception:
+        return False
+
+
+def _resolver_a_canonica(
+    nombre: str,
+    umbral: float = 0.55,
+) -> tuple[str | None, float]:
+    """
+    Retorna (nombre_canonico, similitud) o (None, sim) si no hay match.
+
+    1. Match exacto normalizado (_norm) contra cat_ids.csv
+    2. Si no, TF-IDF char_wb coseno vs las categorías canónicas (umbral por defecto 0.55)
+    """
+    nombre = str(nombre).strip()
+    if not nombre:
+        return None, 0.0
+
+    if not _ensure_cats_vectorizer():
+        return None, 0.0
+
+    assert _CATS_CANONICAS is not None
+    norm_exact = {_norm(c): c for c in _CATS_CANONICAS}
+    norm_key = _norm(nombre)
+    if norm_key in norm_exact:
+        return norm_exact[norm_key], 1.0
+
+    assert _CATS_VECTORIZER is not None
+    q_vec = _CATS_VECTORIZER.transform([nombre])
+    sims = cosine_similarity(q_vec, _CATS_MATRIX).ravel()
+    idx = int(sims.argmax())
+    sim = float(sims[idx])
+    if sim >= umbral:
+        return _CATS_CANONICAS[idx], sim
+    return None, sim
+
+
+def _cargar_cat_ids_map() -> None:
+    """Carga cat_ids.csv en mapas upper y _norm → CAT_ID."""
+    global _CAT_IDS_MAP, _CAT_IDS_NORM_MAP
+    if _CAT_IDS_MAP is not None:
+        return
+    _CAT_IDS_MAP = {}
+    _CAT_IDS_NORM_MAP = {}
+    if not _CAT_IDS_PATH.exists():
+        return
+    try:
+        df = pd.read_csv(_CAT_IDS_PATH, dtype=str)
+        if "CATEGORIA_FINAL" not in df.columns or "CAT_ID" not in df.columns:
+            return
+        for _, row in df.iterrows():
+            cat = str(row["CATEGORIA_FINAL"]).strip()
+            cid = str(row["CAT_ID"]).strip()
+            if not cat or not cid:
+                continue
+            _CAT_IDS_MAP[cat.upper()] = cid
+            _CAT_IDS_NORM_MAP[_norm(cat)] = cid
+    except Exception:
+        pass
+
+
+def _cat_id_para(categoria_name: str) -> str:
+    """CAT_ID estable desde cat_ids.csv (no depende del parquet regional)."""
+    _cargar_cat_ids_map()
+    assert _CAT_IDS_MAP is not None and _CAT_IDS_NORM_MAP is not None
+    name = str(categoria_name).strip()
+    if not name:
+        return ""
+    cid = _CAT_IDS_MAP.get(name.upper(), "")
+    if cid:
+        return cid
+    cid = _CAT_IDS_NORM_MAP.get(_norm(name), "")
+    if cid:
+        return cid
+    canon, _ = _resolver_a_canonica(name)
+    if canon:
+        cid = _CAT_IDS_MAP.get(canon.upper(), "")
+        if cid:
+            return cid
+        return _CAT_IDS_NORM_MAP.get(_norm(canon), "")
+    return ""
+
+
+def _categorias_validas_desde_estudio() -> set[str]:
+    """Categorías del estudio (hoja total) para validar splits compuestos."""
+    ruta = ESTUDIO_MERCADO_DIR / "Estudio_Mercado_Colombia.xlsx"
+    if not ruta.exists():
+        return set()
+    try:
+        df_col = pd.read_excel(
+            ruta, sheet_name="total", header=1, usecols=["CATEGORIA_FINAL"]
+        )
+        return set(df_col["CATEGORIA_FINAL"].dropna().astype(str).str.strip().unique())
+    except Exception:
+        return set()
+
+
+def _expandir_categorias_compuestas(
+    df: pd.DataFrame,
+    cats_validas: set[str],
+    col_cat: str = "CATEGORIA",
+) -> pd.DataFrame:
+    """
+    Expande filas cuya columna col_cat contiene múltiples categorías
+    unidas por '-' en filas independientes, una por categoría válida.
+
+    Reglas:
+    - Si la categoría completa ya coincide con una válida → sin cambio.
+    - Si no coincide → dividir en '-' (con espacios opcionales), validar
+      cada fragmento, crear una fila por fragmento válido.
+    - Fragmentos sin match en cats_validas → se descartan con log_warning.
+    - Si ningún fragmento es válido → conservar fila original sin cambio
+      (para no perder datos) y emitir log_warning.
+    - La función es idempotente: si ya está correctamente separada,
+      no hace nada.
+
+    Args:
+        df: DataFrame con los programas a valorizar.
+        cats_validas: conjunto de categorías normalizadas válidas.
+        col_cat: nombre de la columna de categoría en df.
+
+    Returns:
+        DataFrame expandido (puede tener más filas que el original).
+    """
+    if not cats_validas:
+        return df.copy()
+    if col_cat not in df.columns:
+        return df.copy()
+
+    cats_norm_map: dict[str, str] = {_norm_cat(c): c for c in cats_validas}
+    filas_out: list[pd.Series] = []
+
+    for _, fila in df.iterrows():
+        cat_original = str(fila.get(col_cat, "") or "").strip()
+
+        # Caso 1: ya es una categoría válida → sin cambio
+        if _norm_cat(cat_original) in cats_norm_map:
+            filas_out.append(fila)
+            continue
+
+        # Caso 2: contiene '-' → intentar split
+        if "-" in cat_original:
+            partes = [p.strip() for p in _re.split(r"\s*-\s*", cat_original)]
+            partes = [p for p in partes if p]  # quitar vacíos
+
+            validas: list[str] = []
+            invalidas: list[str] = []
+            for parte in partes:
+                key = _norm_cat(parte)
+                if key in cats_norm_map:
+                    validas.append(cats_norm_map[key])  # nombre canónico
+                    continue
+                canon, sim = _resolver_a_canonica(parte)
+                if canon is not None:
+                    canon_key = _norm_cat(canon)
+                    if canon_key in cats_norm_map:
+                        nombre_canon = cats_norm_map[canon_key]
+                        validas.append(nombre_canon)
+                        log_info(
+                            f"[Valorización] Categoría resuelta automáticamente: "
+                            f"'{parte}' → '{nombre_canon}' (sim={sim:.2f})"
+                        )
+                        continue
+                invalidas.append(parte)
+
+            if invalidas:
+                prog = fila.get("PROGRAMA_EAFIT", fila.get(col_cat, "?"))
+                log_warning(
+                    f"[Valorización] '{prog}': fragmentos no encontrados "
+                    f"en las 288 categorías → {invalidas}. Se descartan."
+                )
+
+            if validas:
+                for cat_valida in validas:
+                    nueva = fila.copy()
+                    nueva[col_cat] = cat_valida
+                    filas_out.append(nueva)
+                continue  # ya procesado
+
+        # Caso 3: no tiene '-' y no matchea → intentar resolución fuzzy
+        canon, sim = _resolver_a_canonica(cat_original)
+        if canon is not None:
+            canon_key = _norm_cat(canon)
+            if canon_key in cats_norm_map:
+                nombre_canon = cats_norm_map[canon_key]
+                log_info(
+                    f"[Valorización] Categoría resuelta automáticamente: "
+                    f"'{cat_original}' → '{nombre_canon}' (sim={sim:.2f})"
+                )
+                nueva = fila.copy()
+                nueva[col_cat] = nombre_canon
+                filas_out.append(nueva)
+                continue
+
+        prog = fila.get("PROGRAMA_EAFIT", cat_original)
+        log_warning(
+            f"[Valorización] Categoría '{cat_original}' (programa: '{prog}') "
+            f"no se encontró en las 288 categorías válidas. "
+            f"Se conserva sin modificar."
+        )
+        filas_out.append(fila)
+
+    if not filas_out:
+        return df.iloc[0:0].copy()  # DataFrame vacío con mismas columnas
+
+    return pd.DataFrame(filas_out).reset_index(drop=True)
+
+
+def _proyeccion_regresion_lineal(
+    serie_pc: dict[int, float],
+    año_objetivo: int,
+    tasa_captura: float,
+) -> float:
+    """
+    Proyecta estudiantes esperados para EAFIT usando regresión lineal
+    sobre la serie histórica de primer_curso de la categoría × región.
+
+    Args:
+        serie_pc: {año: promedio_primer_curso} — solo años con datos válidos.
+        año_objetivo: año al que se proyecta (ANO_LANZAMIENTO del programa).
+        tasa_captura: fracción del mercado que capturaría EAFIT (TASA_CAPTURA_EAFIT).
+
+    Returns:
+        Estudiantes proyectados (entero ≥ 1), o np.nan si datos insuficientes.
+    """
+    pts = [
+        (yr, val)
+        for yr, val in serie_pc.items()
+        if pd.notna(val) and val > 0
+    ]
+    if len(pts) < 3:
+        # Insuficientes puntos para regresión confiable
+        return np.nan
+
+    xs = np.array([p[0] for p in pts], dtype=float)
+    ys = np.array([p[1] for p in pts], dtype=float)
+
+    # Regresión lineal por mínimos cuadrados (grado 1)
+    coef = np.polyfit(xs, ys, 1)          # [pendiente, intercepto]
+    pred_mercado = np.polyval(coef, año_objetivo)
+
+    if pred_mercado <= 0:
+        return np.nan
+
+    return max(1, round(pred_mercado * tasa_captura))
+
+
+def _serie_primer_curso_sub(sub: pd.DataFrame) -> dict[int, float]:
+    """Promedio anual de primer_curso_YYYY en el subconjunto (categoría × región)."""
+    _serie_pc: dict[int, float] = {}
+    for _yr in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
+        _col_yr = f"primer_curso_{_yr}"
+        if _col_yr in sub.columns:
+            _val = float(sub[_col_yr].mean())
+            if not np.isnan(_val):
+                _serie_pc[_yr] = _val
+    return _serie_pc
+
+
+def _subconjunto_por_categorias(df: pd.DataFrame, categorias: list[str]) -> pd.DataFrame:
+    """Filtra filas de la sábana cuya CATEGORIA_FINAL coincide con alguna categoría."""
+    if df is None or len(df) == 0 or "CATEGORIA_FINAL" not in df.columns:
+        return pd.DataFrame()
+    work = df
+    col_norm = "_cat_norm_cached"
+    if col_norm not in work.columns:
+        work = work.copy()
+        work[col_norm] = work["CATEGORIA_FINAL"].apply(lambda x: _norm(str(x)))
+    mask = pd.Series(False, index=work.index)
+    for cat in categorias:
+        mask = mask | (work[col_norm] == _norm(cat))
+    return work[mask]
+
+
 def _agregar_metricas_categoria(
     df_region: pd.DataFrame,
     categorias: list[str],
@@ -407,6 +731,7 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
             "programas_inactivos": 0,
             "costo_promedio": np.nan,
             "pct_con_matricula": 0.0,
+            "serie_primer_curso": {},
         }
 
     # Matrícula
@@ -460,6 +785,9 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
 
     pct_con_mat = num_prog / prog_activos if prog_activos > 0 else 0.0
 
+    # ── Serie histórica primer_curso para regresión ─────────────────────
+    _serie_pc = _serie_primer_curso_sub(sub)
+
     return {
         f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": prom_mat,  # nombre primario para scoring.py
         f"prom_matricula_{AÑO_FIN_DATOS}": prom_mat,  # alias para columnas Excel
@@ -477,6 +805,7 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
         "programas_inactivos": prog_inactivos,
         "costo_promedio": costo,
         "pct_con_matricula": pct_con_mat,
+        "serie_primer_curso": _serie_pc,
     }
 
 
@@ -505,6 +834,18 @@ def _score_y_calificacion(metricas: dict) -> dict:
     )
     df_scored = apply_scoring(df_tmp, modo_local=False)
     row = df_scored.iloc[0]
+
+    # apply_scoring con 1 fila colapsa score_participacion a 1; corregir calificacion_final.
+    score_part_precomp = int(metricas.get("score_participacion", 1))
+    score_part_colapso = int(row.get("score_participacion", 1))
+    cal_final = float(row.get("calificacion_final", 1.0))
+    cal_final_correcto = round(
+        cal_final
+        - score_part_colapso * _SCORE_PARTICIPACION_PESO
+        + score_part_precomp * _SCORE_PARTICIPACION_PESO,
+        4,
+    )
+
     return {
         **metricas,
         "score_matricula":          row.get("score_matricula", 1),
@@ -517,7 +858,7 @@ def _score_y_calificacion(metricas: dict) -> dict:
         "score_pct_no_matriculados": row.get("score_pct_no_matriculados", 1),
         "score_num_programas":      row.get("score_num_programas", 1),
         "score_costo":              row.get("score_costo", 1),
-        "calificacion_final":       row.get("calificacion_final", 1.0),
+        "calificacion_final":       cal_final_correcto,
     }
 
 
@@ -593,6 +934,32 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
         )
     else:
         log(f"  Sábana referentes (sin filtro niveles): {len(sabana_ref):,} programas")
+
+    # ── Expandir categorías compuestas ──────────────────────────────
+    _col_cat_val = "CATEGORIA_FINAL"
+    if _col_cat_val in sabana.columns:
+        _cats_validas = set(
+            sabana[_col_cat_val].dropna().astype(str).str.strip().unique()
+        )
+    else:
+        _cats_validas = set()
+
+    if _cats_validas:
+        _n_antes = len(df_programas)
+        df_programas = _expandir_categorias_compuestas(
+            df_programas,
+            _cats_validas,
+            col_cat="CATEGORIA_RAW",
+        )
+        _n_despues = len(df_programas)
+        if _n_despues != _n_antes:
+            log(
+                f"  Categorías compuestas expandidas: "
+                f"{_n_antes} → {_n_despues} filas "
+                f"(+{_n_despues - _n_antes} registros nuevos)"
+            )
+    else:
+        log_warning("  No se pudo obtener lista de categorías válidas para expansión.")
 
     # ── 3. Agregados REFERENTES (Fase 4) + MERCADO desde parquet (TEMP_DIR) ───
     log("  Referentes por región (programas, tras niveles):")
@@ -681,10 +1048,9 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
         if "CATEGORIA_FINAL" in sabana.columns else set()
     cats_sin_match = []
     for _, pr in df_programas.iterrows():
-        for cat in _categorias_de_raw(str(pr["CATEGORIA_RAW"])):
-            cat_n = _norm(cat)
-            if cat_n not in cats_sabana:
-                cats_sin_match.append(cat)
+        cat_n = _norm(str(pr["CATEGORIA_RAW"]))
+        if cat_n not in cats_sabana:
+            cats_sin_match.append(str(pr["CATEGORIA_RAW"]))
     if cats_sin_match:
         log_warning(f"  ⚠ {len(cats_sin_match)} categorías del archivo no matchean en sábana:")
         for c in set(cats_sin_match):
@@ -701,12 +1067,27 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
         nivel = str(prog_row["NIVEL"]).strip()
         programa = str(prog_row["PROGRAMA_EAFIT"]).strip()
         tiene_em = str(prog_row["TIENE_ESTUDIO_MERCADO"]).strip()
-        categorias = _categorias_de_raw(cat_raw)
+        categorias = [cat_raw]
 
         for seg in SEGMENTOS:
             region = LABEL_REGION[seg]
             # MERCADO: agregado regional (parquet Fase 4 por segmento)
             met_m = _lookup_categoria(agregados.get(seg), categorias)
+
+            # Si el parquet no trae primer_curso, calcular prom desde sábana regional (no matrícula total)
+            _pmp_key = f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"
+            _pmp_parquet = float(met_m.get(_pmp_key, 0) or 0)
+            if _pmp_parquet == 0.0:
+                df_seg = SEGMENTOS_FILTROS[seg](sabana)
+                if len(df_seg) > 0:
+                    met_sabana = _agregar_metricas_categoria(df_seg, categorias)
+                    _pmp_sab = float(met_sabana.get(_pmp_key, 0) or 0)
+                    if _pmp_sab > 0:
+                        met_m = {
+                            **met_m,
+                            _pmp_key: _pmp_sab,
+                            f"prom_matricula_{AÑO_FIN_DATOS}": _pmp_sab,
+                        }
 
             # Fallback AAGR: si el regional es NaN, usar el nacional (tendencia de largo plazo)
             if pd.isna(met_m.get("AAGR_ROBUSTO")) and ag_colombia is not None:
@@ -723,6 +1104,10 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
 
             # REFERENTES: agregado Fase 4 sobre IES referentes NACIONALES (sin filtro regional)
             met_r = _lookup_categoria(ag_ref_nacional, categorias)
+            _sub_ref = _subconjunto_por_categorias(sabana_ref, categorias)
+            met_r["serie_primer_curso"] = (
+                _serie_primer_curso_sub(_sub_ref) if len(_sub_ref) else {}
+            )
             met_r_s = _score_y_calificacion(met_r)
 
             # CAL_INTEGRADA = 0.4 × M + 0.6 × R
@@ -746,7 +1131,7 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                 {
                     # Identificación
                     "PROG_ID": str(prog_row.get("PROG_ID", "")),
-                    "CAT_ID": str(met_m_s.get("CAT_ID", "") or ""),
+                    "CAT_ID": _cat_id_para(cat_raw),
                     "CATEGORIA": cat_raw,
                     "NIVEL": nivel,
                     "PROGRAMA_EAFIT": programa,
@@ -802,13 +1187,26 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                         "BAJA" if cal_integrada >= 2.5 else
                         "MUY_BAJA"
                     ) if pd.notna(cal_integrada) else np.nan,
-                    "PROYECCION_ANUAL": max(
-                        1,
-                        round(
-                            float(met_r_s.get(f"prom_matricula_{AÑO_FIN_DATOS}", 0) or 0)
-                            * TASA_CAPTURA_EAFIT
-                        ),
-                    ) if pd.notna(met_r_s.get(f"prom_matricula_{AÑO_FIN_DATOS}")) else np.nan,
+                    "PROYECCION_REGRESION": (
+                        _proyeccion_regresion_lineal(
+                            serie_pc=met_r_s.get("serie_primer_curso", {}),
+                            año_objetivo=int(
+                                _ANO_LANZAMIENTO_URGENTE
+                                if (
+                                    pd.notna(cal_integrada)
+                                    and cal_integrada >= 3.5
+                                    and float(met_r_s.get("AAGR_ROBUSTO", 0) or 0) >= 0.05
+                                )
+                                else _ANO_LANZAMIENTO_NORMAL
+                                if (pd.notna(cal_integrada) and cal_integrada >= 3.0)
+                                else AÑO_FIN_DATOS + 2
+                            ),
+                            tasa_captura=TASA_CAPTURA_EAFIT,
+                        )
+                        if pd.notna(cal_integrada)
+                        else np.nan
+                    ),
+                    "PROYECCION_PENDIENTE": np.nan,
                     "ANO_LANZAMIENTO": (
                         _ANO_LANZAMIENTO_URGENTE
                         if (
@@ -850,7 +1248,8 @@ def _reordenar_columnas_valorizacion(df_out: pd.DataFrame) -> pd.DataFrame:
     ]
     _cols_concl = [
         "VIABILIDAD_ESTUDIO", "CAL_INTEGRADA",
-        "ANO_LANZAMIENTO", "SEMESTRE_LANZAMIENTO", "PROYECCION_ANUAL",
+        "ANO_LANZAMIENTO", "SEMESTRE_LANZAMIENTO",
+        "PROYECCION_REGRESION", "PROYECCION_PENDIENTE",
     ]
     _cols_m = [c for c in df_out.columns if c.startswith("M_")]
     _cols_r = [c for c in df_out.columns if c.startswith("R_")]
@@ -910,7 +1309,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     ws.insert_rows(1, 2)
 
     N_ID = 7  # PROG_ID, CAT_ID, Categoría, Nivel, Programa, ¿Tiene estudio?, Región
-    N_CONCL = 5  # VIABILIDAD, CAL_INTEGRADA, AÑO, SEMESTRE, PROYECCIÓN
+    N_CONCL = 6  # VIABILIDAD, CAL_INTEGRADA, AÑO, SEMESTRE, 2 proyecciones
     N_MET = len(_cols_m)  # columnas M_ (dinámico, actualmente 19)
 
     DORADO_CONCL = "7B5E00"  # dorado oscuro para sección conclusión
@@ -980,7 +1379,8 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "R_calificacion": "CALIFICACIÓN",
         "CAL_INTEGRADA": "CAL. INTEGRADA (40%M + 60%R)",
         "VIABILIDAD_ESTUDIO": "Viabilidad Estudio",
-        "PROYECCION_ANUAL": "Proyección Anual (estudiantes)",
+        "PROYECCION_REGRESION": "Proyección Regresión Lineal (est.)",
+        "PROYECCION_PENDIENTE": "Proyección 2 (pendiente)",
         "ANO_LANZAMIENTO": "Año Lanzamiento",
         "SEMESTRE_LANZAMIENTO": "Semestre",
     }
@@ -1020,7 +1420,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         ci
         for ci, c in enumerate(cols, 1)
         if any(k in c for k in ("num_programas", "activos", "nuevos", "inactivos"))
-        or c in ("PROYECCION_ANUAL", "ANO_LANZAMIENTO")
+        or c in ("PROYECCION_REGRESION", "ANO_LANZAMIENTO")
     }
     cost_cols = {ci for ci, c in enumerate(cols, 1) if "costo_promedio" in c}
     prom_cols = {ci for ci, c in enumerate(cols, 1) if "prom_matricula" in c}
@@ -1113,7 +1513,8 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "REGION": 13,
         "CAL_INTEGRADA": 16,
         "VIABILIDAD_ESTUDIO": 16,
-        "PROYECCION_ANUAL": 22,
+        "PROYECCION_REGRESION": 26,
+        "PROYECCION_PENDIENTE": 22,
         "ANO_LANZAMIENTO": 14,
         "SEMESTRE_LANZAMIENTO": 11,
     }

@@ -3417,11 +3417,11 @@ class GestionProgramasDialog(tk.Toplevel):
         self.resizable(True, True)
         self.configure(bg=EAFIT["bg"])
 
-        w, h = 760, 680
+        w, h = 780, 800
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(640, 520)
+        self.minsize(720, 720)
 
         self._ruta = self._encontrar_archivo()
         self._df = self._cargar()
@@ -3477,7 +3477,25 @@ class GestionProgramasDialog(tk.Toplevel):
 
         df[self._COL_PROGRAMA] = df[self._COL_PROGRAMA].astype(str).str.strip()
         df = df[df[self._COL_PROGRAMA].astype(str).str.len() > 0]
-        df = df.drop_duplicates(subset=[self._COL_PROGRAMA], keep="first").reset_index(drop=True)
+
+        # Expandir categorías compuestas si hay categorías válidas disponibles
+        try:
+            from etl.valorizacion_pipeline import (
+                _categorias_validas_desde_estudio,
+                _expandir_categorias_compuestas,
+            )
+
+            _cats_validas_gui = _categorias_validas_desde_estudio()
+            if _cats_validas_gui:
+                df = _expandir_categorias_compuestas(
+                    df, _cats_validas_gui, col_cat=self._COL_CATEGORIA
+                )
+        except Exception:
+            pass  # Si falla, continuar sin expandir (no bloquear la GUI)
+
+        df = df.drop_duplicates(
+            subset=[self._COL_PROGRAMA, self._COL_CATEGORIA], keep="first"
+        ).reset_index(drop=True)
         return df[cols_df]
 
     def _guardar(self) -> bool:
@@ -3538,46 +3556,30 @@ class GestionProgramasDialog(tk.Toplevel):
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(2, 14))
 
-        tabla_frame = ttk.Frame(main, style="Card.TFrame", padding=12)
-        tabla_frame.pack(fill=tk.BOTH, expand=True)
+        # ── Pie fijo: botones Guardar/Cancelar ──────────────────────
+        btn_row = ttk.Frame(main, style="App.TFrame")
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
 
-        ttk.Label(tabla_frame, text="Programas actuales", style="SectionTitle.TLabel").pack(
-            anchor="w", pady=(0, 6)
-        )
-
-        tree_frame = ttk.Frame(tabla_frame, style="Card.TFrame")
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-
-        self._tree = ttk.Treeview(
-            tree_frame,
-            columns=("programa", "categoria", "nivel", "estudio"),
-            show="headings",
-            height=12,
-            selectmode="browse",
-        )
-        self._tree.heading("programa", text="Nombre del Programa")
-        self._tree.heading("categoria", text="Categoría")
-        self._tree.heading("nivel", text="Nivel")
-        self._tree.heading("estudio", text="¿Tiene estudio?")
-        self._tree.column("programa", width=300, anchor="w")
-        self._tree.column("categoria", width=180, anchor="w")
-        self._tree.column("nivel", width=110, anchor="w")
-        self._tree.column("estudio", width=90, anchor="center")
-
-        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._tree.yview)
-        self._tree.configure(yscrollcommand=sb.set)
-        self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._lbl_estado = ttk.Label(btn_row, text="", style="Muted.TLabel", font=("Segoe UI", 9))
+        self._lbl_estado.pack(side=tk.LEFT)
 
         ttk.Button(
-            tabla_frame,
-            text="🗑 Eliminar seleccionado",
-            command=self._eliminar_seleccionado,
+            btn_row,
+            text="Cancelar",
+            command=self._confirmar_cierre,
             style="Secondary.TButton",
-        ).pack(anchor="e", pady=(8, 0))
+        ).pack(side=tk.RIGHT, padx=(8, 0))
 
-        add_frame = ttk.Frame(main, padding=(12, 10, 12, 0), style="Card.TFrame")
-        add_frame.pack(fill=tk.X, pady=(14, 0))
+        ttk.Button(
+            btn_row,
+            text="💾  Guardar cambios",
+            command=self._guardar_y_cerrar,
+            style="Primary.TButton",
+        ).pack(side=tk.RIGHT)
+
+        # ── Formulario fijo encima del pie (no lo comprime la tabla) ─
+        add_frame = ttk.Frame(main, padding=(12, 10, 12, 10), style="Card.TFrame")
+        add_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 10))
 
         ttk.Label(add_frame, text="Añadir programa candidato", style="SectionTitle.TLabel").pack(
             anchor="w", pady=(0, 8)
@@ -3598,8 +3600,20 @@ class GestionProgramasDialog(tk.Toplevel):
         self._entry_categoria = ttk.Entry(campos, font=("Segoe UI", 10), width=46)
         self._entry_categoria.grid(row=1, column=1, sticky="ew", pady=4)
 
-        ttk.Label(campos, text="Nivel:", style="Body.TLabel", width=22).grid(
+        ttk.Label(campos, text="Categoría 2 (opcional):", style="Body.TLabel", width=22).grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        self._entry_categoria2 = ttk.Entry(campos, font=("Segoe UI", 10), width=46)
+        self._entry_categoria2.grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Label(
+            campos,
+            text="Si se llena, se crean dos registros independientes.",
+            style="Muted.TLabel",
+            font=("Segoe UI", 8),
+        ).grid(row=3, column=1, sticky="w", pady=(0, 4))
+
+        ttk.Label(campos, text="Nivel:", style="Body.TLabel", width=22).grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=4
         )
         self._nivel_var = tk.StringVar(value="Maestría")
         nivel_cb = ttk.Combobox(
@@ -3609,13 +3623,13 @@ class GestionProgramasDialog(tk.Toplevel):
             state="readonly",
             width=20,
         )
-        nivel_cb.grid(row=2, column=1, sticky="w", pady=4)
+        nivel_cb.grid(row=4, column=1, sticky="w", pady=4)
 
         ttk.Label(campos, text="¿Tiene estudio?:", style="Body.TLabel", width=22).grid(
-            row=3, column=0, sticky="w", padx=(0, 8), pady=4
+            row=5, column=0, sticky="w", padx=(0, 8), pady=4
         )
         estudio_frame = ttk.Frame(campos, style="Card.TFrame")
-        estudio_frame.grid(row=3, column=1, sticky="w", pady=4)
+        estudio_frame.grid(row=5, column=1, sticky="w", pady=4)
         self._estudio_var = tk.StringVar(value="No")
         ttk.Radiobutton(estudio_frame, text="Sí", variable=self._estudio_var, value="Si").pack(
             side=tk.LEFT
@@ -3649,25 +3663,44 @@ class GestionProgramasDialog(tk.Toplevel):
             font=("Segoe UI", 8),
         ).pack(side=tk.LEFT, padx=(14, 0))
 
-        btn_row = ttk.Frame(main, style="App.TFrame")
-        btn_row.pack(fill=tk.X, pady=(16, 0))
+        # ── Tabla: solo el espacio central restante ─────────────────
+        tabla_frame = ttk.Frame(main, style="Card.TFrame", padding=12)
+        tabla_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        self._lbl_estado = ttk.Label(btn_row, text="", style="Muted.TLabel", font=("Segoe UI", 9))
-        self._lbl_estado.pack(side=tk.LEFT)
+        ttk.Label(tabla_frame, text="Programas actuales", style="SectionTitle.TLabel").pack(
+            anchor="w", pady=(0, 6)
+        )
+
+        tree_frame = ttk.Frame(tabla_frame, style="Card.TFrame")
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._tree = ttk.Treeview(
+            tree_frame,
+            columns=("programa", "categoria", "nivel", "estudio"),
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        self._tree.heading("programa", text="Nombre del Programa")
+        self._tree.heading("categoria", text="Categoría")
+        self._tree.heading("nivel", text="Nivel")
+        self._tree.heading("estudio", text="¿Tiene estudio?")
+        self._tree.column("programa", width=300, anchor="w")
+        self._tree.column("categoria", width=180, anchor="w")
+        self._tree.column("nivel", width=110, anchor="w")
+        self._tree.column("estudio", width=90, anchor="center")
+
+        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=sb.set)
+        self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
         ttk.Button(
-            btn_row,
-            text="Cancelar",
-            command=self._confirmar_cierre,
+            tabla_frame,
+            text="🗑 Eliminar seleccionado",
+            command=self._eliminar_seleccionado,
             style="Secondary.TButton",
-        ).pack(side=tk.RIGHT, padx=(8, 0))
-
-        ttk.Button(
-            btn_row,
-            text="💾  Guardar cambios",
-            command=self._guardar_y_cerrar,
-            style="Primary.TButton",
-        ).pack(side=tk.RIGHT)
+        ).pack(anchor="e", pady=(8, 0))
 
         self.protocol("WM_DELETE_WINDOW", self._confirmar_cierre)
 
@@ -3693,38 +3726,67 @@ class GestionProgramasDialog(tk.Toplevel):
     def _añadir_programa(self) -> None:
         nombre = self._entry_nombre.get().strip()
         if not nombre:
-            messagebox.showwarning("Campo vacío", "Escribe el nombre del programa.", parent=self)
+            messagebox.showwarning(
+                "Campo vacío", "Escribe el nombre del programa.", parent=self
+            )
             return
 
-        categoria = self._entry_categoria.get().strip()
-        if not categoria:
+        cat1 = self._entry_categoria.get().strip()
+        cat2 = self._entry_categoria2.get().strip()
+
+        if not cat1:
             messagebox.showwarning(
                 "Campo vacío",
-                "Indica la categoría de mercado (ej. ANALITICA DE DATOS).",
+                "Indica al menos una categoría de mercado "
+                "(ej. ANALITICA DE DATOS).",
                 parent=self,
             )
             return
 
-        nombres_norm = self._df[self._COL_PROGRAMA].astype(str).str.strip().str.lower()
-        if nombre.lower() in nombres_norm.values:
-            messagebox.showinfo("Duplicado", f'"{nombre}" ya está en la lista.', parent=self)
-            return
+        categorias = [cat1]
+        if cat2:
+            categorias.append(cat2)
 
-        nueva_fila = pd.DataFrame(
-            [
-                {
-                    self._COL_CATEGORIA: categoria,
-                    self._COL_NIVEL: self._nivel_var.get().strip(),
-                    self._COL_PROGRAMA: nombre,
-                    self._COL_ESTUDIO: self._estudio_var.get(),
-                }
-            ]
+        existing = set(
+            zip(
+                self._df[self._COL_PROGRAMA].astype(str).str.strip().str.lower(),
+                self._df[self._COL_CATEGORIA].astype(str).str.strip().str.lower(),
+            )
         )
-        self._df = pd.concat([self._df, nueva_fila], ignore_index=True)
-        self._modificado = True
-        self._entry_nombre.delete(0, tk.END)
-        self._entry_categoria.delete(0, tk.END)
-        self._refrescar_tabla()
+
+        nuevas_filas: list[dict] = []
+        ya_existen: list[str] = []
+        for cat in categorias:
+            key = (nombre.lower(), cat.lower())
+            if key in existing:
+                ya_existen.append(cat)
+            else:
+                nuevas_filas.append(
+                    {
+                        self._COL_CATEGORIA: cat,
+                        self._COL_NIVEL: self._nivel_var.get().strip(),
+                        self._COL_PROGRAMA: nombre,
+                        self._COL_ESTUDIO: self._estudio_var.get(),
+                    }
+                )
+
+        if ya_existen:
+            messagebox.showinfo(
+                "Duplicado",
+                f'"{nombre}" ya existe con la categoría: '
+                f'{", ".join(ya_existen)}.',
+                parent=self,
+            )
+
+        if nuevas_filas:
+            self._df = pd.concat(
+                [self._df, pd.DataFrame(nuevas_filas)], ignore_index=True
+            )
+            self._modificado = True
+            self._entry_nombre.delete(0, tk.END)
+            self._entry_categoria.delete(0, tk.END)
+            self._entry_categoria2.delete(0, tk.END)
+            self._refrescar_tabla()
 
     def _eliminar_seleccionado(self) -> None:
         sel = self._tree.selection()
@@ -3741,6 +3803,19 @@ class GestionProgramasDialog(tk.Toplevel):
         self._refrescar_tabla()
 
     def _importar_excel(self) -> None:
+        self._cats_validas_importar: set[str] = set()
+        try:
+            from etl.valorizacion_pipeline import (
+                _categorias_validas_desde_estudio,
+                _norm_cat,
+            )
+
+            _cats_list = _categorias_validas_desde_estudio()
+            self._cats_validas_importar = {_norm_cat(c) for c in _cats_list}
+            self._cats_canon_importar = {_norm_cat(c): c for c in _cats_list}
+        except Exception:
+            self._cats_canon_importar = {}
+
         ruta = filedialog.askopenfilename(
             title="Seleccionar Excel con programas candidatos",
             filetypes=[("Excel", "*.xlsx *.xls"), ("Todos", "*.*")],
@@ -3770,6 +3845,13 @@ class GestionProgramasDialog(tk.Toplevel):
                 col_cat = c
                 break
 
+        col_cat2 = None
+        for c in df_imp.columns:
+            cl = str(c).strip().lower()
+            if "categor" in cl and cl != str(col_cat).strip().lower():
+                col_cat2 = c
+                break
+
         col_niv = None
         for c in df_imp.columns:
             cl = str(c).strip().lower()
@@ -3785,7 +3867,10 @@ class GestionProgramasDialog(tk.Toplevel):
                 break
 
         nombres_actuales = set(
-            self._df[self._COL_PROGRAMA].astype(str).str.strip().str.lower()
+            zip(
+                self._df[self._COL_PROGRAMA].astype(str).str.strip().str.lower(),
+                self._df[self._COL_CATEGORIA].astype(str).str.strip().str.lower(),
+            )
         )
         nuevos: list[dict[str, str]] = []
         duplicados = 0
@@ -3793,29 +3878,55 @@ class GestionProgramasDialog(tk.Toplevel):
             nombre = str(row[col_prog]).strip()
             if not nombre or nombre.lower() == "nan":
                 continue
-            if nombre.lower() in nombres_actuales:
-                duplicados += 1
-                continue
             estudio = str(row[col_est]).strip() if col_est else "No"
             if estudio.lower() not in ("si", "sí", "yes", "true", "1"):
                 estudio = "No"
             else:
                 estudio = "Si"
-            cat = str(row[col_cat]).strip() if col_cat and pd.notna(row.get(col_cat)) else ""
+            cat_raw = str(row[col_cat]).strip() if col_cat and pd.notna(row.get(col_cat)) else ""
             niv = (
                 str(row[col_niv]).strip()
                 if col_niv and pd.notna(row.get(col_niv))
                 else "Maestría"
             )
-            nuevos.append(
-                {
-                    self._COL_CATEGORIA: cat,
-                    self._COL_NIVEL: niv,
-                    self._COL_PROGRAMA: nombre,
-                    self._COL_ESTUDIO: estudio,
-                }
-            )
-            nombres_actuales.add(nombre.lower())
+
+            # Split de categoría compuesta al importar
+            if "-" in cat_raw and getattr(self, "_cats_validas_importar", None):
+                import re
+
+                from etl.valorizacion_pipeline import _norm_cat
+
+                partes_imp = [p.strip() for p in re.split(r"\s*-\s*", cat_raw)]
+                partes_imp = [p for p in partes_imp if p]
+                canon = getattr(self, "_cats_canon_importar", {})
+                validas_imp = [
+                    canon[_norm_cat(p)]
+                    for p in partes_imp
+                    if _norm_cat(p) in self._cats_validas_importar
+                ]
+                cats_a_crear = validas_imp if validas_imp else [cat_raw]
+            else:
+                cats_a_crear = [cat_raw]
+
+            if col_cat2 and pd.notna(row.get(col_cat2)):
+                cat2_val = str(row[col_cat2]).strip()
+                if cat2_val and cat2_val.lower() != "nan":
+                    cats_a_crear.append(cat2_val)
+
+            for cat_item in cats_a_crear:
+                key = (nombre.lower(), cat_item.lower())
+                if key not in nombres_actuales:
+                    nuevos.append(
+                        {
+                            self._COL_CATEGORIA: cat_item,
+                            self._COL_NIVEL: niv,
+                            self._COL_PROGRAMA: nombre,
+                            self._COL_ESTUDIO: estudio,
+                        }
+                    )
+                    nombres_actuales.add(key)
+                else:
+                    duplicados += 1
 
         if not nuevos:
             msg = "No se encontraron programas nuevos."
