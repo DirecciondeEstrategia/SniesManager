@@ -715,6 +715,15 @@ def run_fase1() -> pd.DataFrame:
         preds = knn_clf.predict(X_pred)
         max_proba = proba_matrix.max(axis=1)
 
+        clases = knn_clf.classes_
+        if proba_matrix.shape[1] >= 2:
+            top2_idx = np.argsort(proba_matrix, axis=1)[:, -2:][:, ::-1]
+            segunda_cat = clases[top2_idx[:, 1]]
+            segunda_proba = proba_matrix[np.arange(len(proba_matrix)), top2_idx[:, 1]]
+        else:
+            segunda_cat = np.array([""] * len(preds))
+            segunda_proba = np.zeros(len(preds))
+
         df_base.loc[mask_sin_cat_final, "CATEGORIA_FINAL"] = preds
         df_base.loc[mask_sin_cat_final, "FUENTE_CATEGORIA"] = "KNN_TFIDF"
         df_base.loc[mask_sin_cat_final, "PROBABILIDAD"] = pd.Series(
@@ -724,6 +733,12 @@ def run_fase1() -> pd.DataFrame:
             (max_proba < 0.50),
             index=df_base.index[mask_sin_cat_final],
         ).astype(bool)
+        df_base.loc[mask_sin_cat_final, "CATEGORIA_ALTERNATIVA"] = pd.Series(
+            segunda_cat, index=df_base.index[mask_sin_cat_final]
+        )
+        df_base.loc[mask_sin_cat_final, "PROBABILIDAD_ALTERNATIVA"] = pd.Series(
+            segunda_proba.round(4), index=df_base.index[mask_sin_cat_final]
+        )
 
         n_total_pred = int(mask_sin_cat_final.sum())
         n_revision = int((max_proba < 0.50).sum())
@@ -1825,7 +1840,35 @@ def run_fase4_desde_sabana(
             mask_cagr_ok = cond_pequena & ag["CAGR_primer_curso"].notna()
             aagr_r[mask_cagr_ok] = ag.loc[mask_cagr_ok, "CAGR_primer_curso"]
 
-        aagr_r[cond_nueva] = np.nan
+        # CATEGORIA_NUEVA: AAGR_primer_curso solo si hay >= 3 años con primer_curso > 0
+        MIN_AÑOS_NUEVA = 3
+        if "AAGR_primer_curso" in ag.columns:
+            _cols_pc = [
+                f"suma_primer_curso_{y}"
+                for y in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1)
+                if f"suma_primer_curso_{y}" in ag.columns
+            ]
+            if _cols_pc:
+                _años_con_dato = (ag[_cols_pc].fillna(0) > 0).sum(axis=1)
+            else:
+                _años_con_dato = pd.Series(0, index=ag.index)
+
+            mask_nueva_con_dato = (
+                cond_nueva
+                & (_años_con_dato >= MIN_AÑOS_NUEVA)
+                & ag["AAGR_primer_curso"].notna()
+            )
+            mask_nueva_sin_dato = cond_nueva & ~mask_nueva_con_dato
+
+            aagr_r[mask_nueva_sin_dato] = np.nan
+            log_info(
+                f"CATEGORIA_NUEVA: {int(cond_nueva.sum())} total | "
+                f"{int(mask_nueva_con_dato.sum())} con AAGR_primer_curso "
+                f"(>={MIN_AÑOS_NUEVA} años) | "
+                f"{int(mask_nueva_sin_dato.sum())} con NaN (<{MIN_AÑOS_NUEVA} años)"
+            )
+        else:
+            aagr_r[cond_nueva] = np.nan
         aagr_r[cond_extinta] = -1.0
         aagr_r[cond_sin_act] = np.nan
         ag["AAGR_ROBUSTO"] = aagr_r
@@ -1882,11 +1925,29 @@ def run_fase4_desde_sabana(
             return "CONTRACCION"        # Cae pero dentro de lo esperable por su historia
 
         ag["SEÑAL_TENDENCIA"] = ag.apply(_señal, axis=1)
+
+        # Sobrescribir SEÑAL_TENDENCIA para categorías extintas y sin actividad.
+        if "TIPO_CRECIMIENTO" in ag.columns:
+            mask_extinta = ag["TIPO_CRECIMIENTO"] == "EXTINTA"
+            mask_sin_act = ag["TIPO_CRECIMIENTO"] == "SIN_ACTIVIDAD"
+            ag.loc[mask_extinta, "SEÑAL_TENDENCIA"] = "SIN_ACTIVIDAD"
+            ag.loc[mask_sin_act, "SEÑAL_TENDENCIA"] = "SIN_ACTIVIDAD"
+            n_sin_act_total = int((mask_extinta | mask_sin_act).sum())
+            if n_sin_act_total:
+                log_info(
+                    f"SEÑAL_TENDENCIA: {n_sin_act_total} categorías marcadas como SIN_ACTIVIDAD "
+                    f"(EXTINTA={int(mask_extinta.sum())}, "
+                    f"SIN_ACTIVIDAD_tipo={int(mask_sin_act.sum())})"
+                )
+
         log_info(
             "Momentum YoY calculado. Señales: "
             + ", ".join(
                 f"{s}={int((ag['SEÑAL_TENDENCIA'] == s).sum())}"
-                for s in ["ACELERANDO", "ESTABLE", "DESACELERANDO", "EN_DECLIVE", "CONTRACCION", "SIN_DATO"]
+                for s in [
+                    "ACELERANDO", "ESTABLE", "DESACELERANDO", "EN_DECLIVE",
+                    "CONTRACCION", "SIN_ACTIVIDAD", "SIN_DATO",
+                ]
                 if (ag["SEÑAL_TENDENCIA"] == s).any()
             )
         )
@@ -2300,8 +2361,11 @@ def _escribir_resumen_ejecutivo(
             bold: bool | None = None,
             border_on: bool = False,
         ) -> None:
-            ws.cell(row=r, column=c, value=value)
             cell = ws.cell(row=r, column=c)
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                cell.value = None
+            else:
+                cell.value = value
             if font is not None:
                 cell.font = font
             if bold is not None:
@@ -2319,10 +2383,23 @@ def _escribir_resumen_ejecutivo(
                 cell.fill = fill
             if align is not None:
                 cell.alignment = align
-            if number_format is not None:
-                cell.number_format = number_format
             if border_on:
                 cell.border = border
+            if number_format is not None:
+                cell.number_format = number_format
+
+        def _valor_excel(value, number_fmt: str | None):
+            """Coerce a tipo numérico nativo para que Excel aplique number_format."""
+            if number_fmt is None or value in ("", None):
+                return value
+            if isinstance(value, float) and np.isnan(value):
+                return None
+            if number_fmt == "0.0%":
+                return float(pd.to_numeric(value, errors="coerce"))
+            if number_fmt in ("#,##0", "0.00"):
+                num = pd.to_numeric(value, errors="coerce")
+                return None if pd.isna(num) else float(num)
+            return value
 
         def merge_and_set_title(
             r: int, c1: int, c2: int, value: str, *, fill: PatternFill, font: Font
@@ -2419,18 +2496,26 @@ def _escribir_resumen_ejecutivo(
         ]
 
         start_row_kpi = 4
-        for i, (label, value, fmt, is_percent) in enumerate(kpis):
+        for i, (label, value, fmt, _is_percent) in enumerate(kpis):
             r = start_row_kpi + i
             set_cell(r, 1, label, font=Font(bold=True), align=XLAlignment(horizontal="left"), border_on=False)
-            set_cell(r, 2, value, number_format=fmt, align=XLAlignment(horizontal="right"), border_on=False)
+            set_cell(
+                r,
+                2,
+                _valor_excel(value, fmt),
+                number_format=fmt,
+                align=XLAlignment(horizontal="right"),
+                border_on=False,
+            )
 
-            # Semáforo en la celda de conteo (opcional, suave)
+            # Semáforo en la celda de conteo (opcional, suave) — solo fill, preserva number_format
+            cell_val = ws.cell(row=r, column=2)
             if "VERDES" in label:
-                ws.cell(row=r, column=2).fill = PatternFill(start_color=VERDE_FILL, end_color=VERDE_FILL, fill_type="solid")
+                cell_val.fill = PatternFill(start_color=VERDE_FILL, end_color=VERDE_FILL, fill_type="solid")
             elif "AMARILLO" in label:
-                ws.cell(row=r, column=2).fill = PatternFill(start_color=AMARILLO_FILL, end_color=AMARILLO_FILL, fill_type="solid")
+                cell_val.fill = PatternFill(start_color=AMARILLO_FILL, end_color=AMARILLO_FILL, fill_type="solid")
             elif "ROJAS" in label:
-                ws.cell(row=r, column=2).fill = PatternFill(start_color=ROJO_FILL, end_color=ROJO_FILL, fill_type="solid")
+                cell_val.fill = PatternFill(start_color=ROJO_FILL, end_color=ROJO_FILL, fill_type="solid")
 
         # Bloque 2 — Rankings por dimensión
         start_row = 17
@@ -2464,6 +2549,7 @@ def _escribir_resumen_ejecutivo(
 
             top = df.sort_values(sort_by, ascending=ascending).head(n) if sort_by in df.columns else df.head(n)
             data_start_r = header_r + 1
+            _PCT_COLS = {"AAGR_suma", "AAGR_ROBUSTO", "AAGR_primer_curso"}
             for k, (_, row) in enumerate(top.iterrows()):
                 r = data_start_r + k
                 for j, dc in enumerate(data_cols):
@@ -2471,7 +2557,7 @@ def _escribir_resumen_ejecutivo(
                     number_fmt = None
                     if dc in {f"suma_matricula_{AÑO_FIN_DATOS}"}:
                         number_fmt = "#,##0"
-                    elif dc in {"AAGR_suma", "AAGR_ROBUSTO"}:
+                    elif dc in _PCT_COLS:
                         number_fmt = "0.0%"
                     elif dc in {"calificacion_final"}:
                         number_fmt = "0.00"
@@ -2482,7 +2568,7 @@ def _escribir_resumen_ejecutivo(
                     set_cell(
                         r,
                         start_c + j,
-                        v,
+                        _valor_excel(v, number_fmt),
                         fill=data_fill if k % 2 == 1 else None,
                         align=XLAlignment(horizontal="left", vertical="center"),
                         number_format=number_fmt,
@@ -2571,7 +2657,13 @@ def _escribir_resumen_ejecutivo(
             pct = (count / total_programas) if total_programas else 0.0
             set_cell(r, 1, source, fill=data_fill if i % 2 else None)
             set_cell(r, 2, int(count), number_format="#,##0", fill=data_fill if i % 2 else None)
-            set_cell(r, 3, pct, number_format="0.0%", fill=data_fill if i % 2 else None)
+            set_cell(
+                r,
+                3,
+                _valor_excel(pct, "0.0%"),
+                number_format="0.0%",
+                fill=data_fill if i % 2 else None,
+            )
             set_cell(r, 4, confianza, fill=data_fill if i % 2 else None)
 
     except Exception as e:
@@ -3448,6 +3540,8 @@ def run_fase5(
                         "CINE_F_2013_AC_CAMPO_DETALLADO",
                         "CATEGORIA_FINAL",
                         "PROBABILIDAD",
+                        "CATEGORIA_ALTERNATIVA",
+                        "PROBABILIDAD_ALTERNATIVA",
                         "NOMBRE_INSTITUCIÓN",
                         "DEPARTAMENTO_OFERTA_PROGRAMA",
                         "ESTADO_PROGRAMA",
@@ -3478,6 +3572,12 @@ def run_fase5(
                                 if pv < 0.50:
                                     for c in range(1, ws_rev.max_column + 1):
                                         ws_rev.cell(row=r, column=c).fill = yellow
+
+                        for prob_col_name in ["PROBABILIDAD", "PROBABILIDAD_ALTERNATIVA"]:
+                            if prob_col_name in df_revision_export.columns:
+                                col_idx = list(df_revision_export.columns).index(prob_col_name) + 1
+                                for r in range(2, ws_rev.max_row + 1):
+                                    ws_rev.cell(row=r, column=col_idx).number_format = "0.0%"
                     except Exception:
                         pass
 
@@ -3883,11 +3983,32 @@ def run_fase6(ag: pd.DataFrame, log) -> pd.DataFrame:
     else:
         df_result["AAGR_PCT"] = np.nan
 
+    # Fallback: si AAGR_PCT es NaN pero existe AAGR_primer_curso en el segmento, usarlo.
+    if "AAGR_primer_curso" in df_result.columns:
+        mask_aagr_nan = df_result["AAGR_PCT"].isna()
+        mask_pc_ok = df_result["AAGR_primer_curso"].notna()
+        mask_cal_ok = df_result["calificacion_final"].notna()
+        mask_fallback = mask_aagr_nan & mask_pc_ok & mask_cal_ok
+        if mask_fallback.any():
+            df_result.loc[mask_fallback, "AAGR_PCT"] = (
+                df_result.loc[mask_fallback, "AAGR_primer_curso"] * 100
+            ).round(2)
+            log(
+                f"AAGR_PCT: {int(mask_fallback.sum())} filas con fallback a AAGR_primer_curso "
+                f"(AAGR_ROBUSTO no disponible en segmento)"
+            )
+
     def _oportunidad(row) -> str:
         c = row.get("calificacion_final")
         a = row.get("AAGR_PCT")
-        if pd.isna(c) or pd.isna(a):
+        if pd.isna(c):
             return "INDETERMINADO"
+        if pd.isna(a):
+            if c >= 4.0:
+                return "MEDIA_ALTA"
+            if c >= 3.0:
+                return "MEDIA"
+            return "BAJA"
         if c >= 4.0 and a > 15:
             return "ALTA"
         if c >= 3.5 or a > 20:
@@ -4220,6 +4341,7 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
         "EN_DECLIVE":    PatternFill("solid", fgColor="FF7043"),  # naranja-rojo
         "CONTRACCION":   PatternFill("solid", fgColor="C62828"),  # rojo oscuro
         "SIN_DATO":      PatternFill("solid", fgColor="EEEEEE"),  # gris neutro
+        "SIN_ACTIVIDAD": PatternFill("solid", fgColor="BDBDBD"),  # gris oscuro — mercado extinto
     }
     SENAL_FONTS = {
         "ACELERANDO":    {"bold": True,  "color": "FFFFFF"},
@@ -4228,6 +4350,7 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
         "EN_DECLIVE":    {"bold": True,  "color": "FFFFFF"},
         "CONTRACCION":   {"bold": True,  "color": "FFFFFF"},
         "SIN_DATO":      {"bold": False, "color": "888888"},
+        "SIN_ACTIVIDAD": {"bold": False, "color": "424242"},
     }
     # Texto con emoji para que sea legible sin necesidad de leyenda
     SENAL_LABELS = {
@@ -4237,6 +4360,7 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
         "EN_DECLIVE":    "↓ EN DECLIVE",
         "CONTRACCION":   "↓↓ CONTRACCION",
         "SIN_DATO":      "— SIN DATO",
+        "SIN_ACTIVIDAD": "✕ SIN ACTIVIDAD",
     }
 
     for r in range(3, ws.max_row + 1):
@@ -4357,6 +4481,8 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
         "CATEGORIA_FINAL",
         "FUENTE_CATEGORIA",
         "PROBABILIDAD",
+        "CATEGORIA_ALTERNATIVA",
+        "PROBABILIDAD_ALTERNATIVA",
         "REQUIERE_REVISION",
     ]
     cols_export = [c for c in COLS_ORDEN if c in df.columns]
@@ -4446,6 +4572,8 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
             "CATEGORIA_FINAL": 32,
             "FUENTE_CATEGORIA": 18,
             "PROBABILIDAD": 14,
+            "CATEGORIA_ALTERNATIVA": 32,
+            "PROBABILIDAD_ALTERNATIVA": 14,
             "REQUIERE_REVISION": 16,
         }
         for ci, col in enumerate(df_h.columns, start=1):
@@ -4502,9 +4630,11 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
                 cell.border = borde
                 cell.alignment = Alignment(vertical="center", wrap_text=False)
 
-                # Formato número para PROBABILIDAD
+                # Formato número para columnas de probabilidad
                 col_name = df_h.columns[ci - 1]
-                if col_name == "PROBABILIDAD" and isinstance(cell.value, (int, float)):
+                if col_name in ("PROBABILIDAD", "PROBABILIDAD_ALTERNATIVA") and isinstance(
+                    cell.value, (int, float)
+                ):
                     cell.number_format = "0.0%"
 
         # Freeze + autofiltro

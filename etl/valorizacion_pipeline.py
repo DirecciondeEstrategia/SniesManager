@@ -24,6 +24,7 @@ from etl.config import (
     AÑO_FIN_DATOS,
     AÑO_INICIO_PRIMER_CURSO,
     OUTPUTS_DIR,
+    RAW_HISTORIC_DIR,
     REF_DIR,
     TEMP_DIR,
     CHECKPOINT_BASE_MAESTRA,
@@ -650,13 +651,18 @@ def _proyeccion_regresion_lineal(
 
 
 def _serie_primer_curso_sub(sub: pd.DataFrame) -> dict[int, float]:
-    """Promedio anual de primer_curso_YYYY en el subconjunto (categoría × región)."""
+    """Sumatoria anual de primer_curso_YYYY en el subconjunto (categoría × región).
+
+    Usa sum() y no mean() porque la regresión proyecta el tamaño total del
+    mercado (todos los programas de esa categoría × región), sobre el que luego
+    se aplica TASA_CAPTURA_EAFIT para estimar los estudiantes de EAFIT.
+    """
     _serie_pc: dict[int, float] = {}
     for _yr in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
         _col_yr = f"primer_curso_{_yr}"
         if _col_yr in sub.columns:
-            _val = float(sub[_col_yr].mean())
-            if not np.isnan(_val):
+            _val = float(sub[_col_yr].sum())
+            if not np.isnan(_val) and _val > 0:
                 _serie_pc[_yr] = _val
     return _serie_pc
 
@@ -860,6 +866,338 @@ def _score_y_calificacion(metricas: dict) -> dict:
         "score_costo":              row.get("score_costo", 1),
         "calificacion_final":       cal_final_correcto,
     }
+
+
+def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construye tabla de crecimiento de mercado con 9 combinaciones de
+    SEGMENTO × SECTOR × MODALIDAD, para ESP y MAE.
+
+    Estructura: bloques apilados con cabecera de filtros + 3 filas de datos
+    (ESPECIALIZACIÓN / MAESTRÍA / Total) por combinación.
+
+    Fuente: archivos primer_curso_YYYY.xlsx en ref/backup/ (no la sábana).
+    El parámetro sabana se conserva por compatibilidad de firma.
+    """
+    del sabana  # no se usa; datos desde backups SNIES
+
+    años = list(range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1))
+    yr_ini = años[0]
+    yr_fin = años[-1]
+
+    def _norm_sheet(name: object) -> str:
+        s2 = _ud.normalize("NFD", str(name))
+        return "".join(ch for ch in s2 if _ud.category(ch) != "Mn").upper()
+
+    def _norm_sector(v: object) -> str:
+        u = str(v).upper().strip()
+        if u in ("PRIVADA", "PRIVADO"):
+            return "PRIVADA"
+        return u
+
+    def _norm_dpto(v: object) -> str:
+        """Unifica variantes SNIES: tildes, puntos finales, comas."""
+        s = str(v).strip().upper().replace(",", "")
+        s = "".join(
+            c for c in _ud.normalize("NFD", s) if _ud.category(c) != "Mn"
+        )
+        return s.replace(".", "").strip()
+
+    def _norm_modalidad(v: object) -> str:
+        """PRESENCIAL | VIRTUAL | A DISTANCIA | HIBRIDA | OTROS"""
+        u = str(v).upper().strip()
+        _es_virtual_puro = (
+            u == "VIRTUAL"
+            or u in ("DISTANCIA (VIRTUAL)", "A DISTANCIA (VIRTUAL)")
+            or (u.startswith("VIRTUAL") and "PRESENCIAL" not in u)
+        )
+        if _es_virtual_puro:
+            return "VIRTUAL"
+        if u == "PRESENCIAL":
+            return "PRESENCIAL"
+        if "DISTANCIA" in u or "TRADICIONAL" in u:
+            return "A DISTANCIA"
+        if "PRESENCIAL" in u and ("VIRTUAL" in u or "DUAL" in u):
+            return "HIBRIDA"
+        if "DUAL" in u or "HIBRIDA" in u or "HÍBRIDA" in u:
+            return "HIBRIDA"
+        return "OTROS"
+
+    def _cargar_año(yr: int) -> pd.DataFrame | None:
+        """Carga y normaliza primer_curso_YYYY → SECTOR, MOD, DPTO, NIVEL, PC."""
+        candidatos = [
+            REF_DIR / "backup" / "matriculas primer curso" / f"primer_curso_{yr}.xlsx",
+            REF_DIR / "backup" / f"primer_curso_{yr}.xlsx",
+            RAW_HISTORIC_DIR / f"primer_curso_{yr}.xlsx",
+            REF_DIR / f"primer_curso_{yr}.xlsx",
+        ]
+        ruta = next((p for p in candidatos if p.exists()), None)
+        if ruta is None:
+            log_warning(f"[Crecimiento] {yr}: archivo no encontrado.")
+            return None
+
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+            try:
+                hoja = next(
+                    (s for s in wb.sheetnames if "INDICE" not in _norm_sheet(s)),
+                    wb.sheetnames[-1],
+                )
+            finally:
+                wb.close()
+
+            df_raw: pd.DataFrame | None = None
+            for hdr in range(5, 13):
+                try:
+                    cand = pd.read_excel(ruta, sheet_name=hoja, header=hdr, dtype=str)
+                except Exception:
+                    continue
+                cols_up = {str(c).upper().strip(): c for c in cand.columns}
+                tiene_nivel = any("NIVEL" in k and "FORMAC" in k for k in cols_up)
+                tiene_pc = any("PRIMER" in k for k in cols_up)
+                if tiene_nivel and tiene_pc:
+                    df_raw = cand
+                    break
+
+            if df_raw is None:
+                preview = pd.read_excel(ruta, sheet_name=hoja, header=None, nrows=40)
+                header_idx: int | None = None
+                for idx in range(len(preview)):
+                    vals = [
+                        str(v).strip()
+                        for v in preview.iloc[idx].tolist()
+                        if pd.notna(v) and str(v).strip()
+                    ]
+                    if not vals or len(vals) < 5:
+                        continue
+                    first_n = _ud.normalize("NFD", vals[0])
+                    first_n = "".join(
+                        ch for ch in first_n if _ud.category(ch) != "Mn"
+                    ).upper()
+                    vals_n = [
+                        "".join(
+                            ch for ch in _ud.normalize("NFD", v)
+                            if _ud.category(ch) != "Mn"
+                        ).upper()
+                        for v in vals
+                    ]
+                    if "CODIGO" in first_n and (
+                        any("SNIES" in v for v in vals_n) or "INSTITUC" in first_n
+                    ):
+                        header_idx = idx
+                        break
+                if header_idx is not None:
+                    cand = pd.read_excel(
+                        ruta, sheet_name=hoja, header=header_idx, dtype=str
+                    )
+                    cols_up = {str(c).upper().strip(): c for c in cand.columns}
+                    if any("NIVEL" in k and "FORMAC" in k for k in cols_up) and any(
+                        "PRIMER" in k for k in cols_up
+                    ):
+                        df_raw = cand
+
+            if df_raw is None:
+                log_warning(f"[Crecimiento] {yr}: no se detectó encabezado válido.")
+                return None
+
+            cols_up = {str(c).upper().strip(): c for c in df_raw.columns}
+
+            col_niv = next(
+                (
+                    orig
+                    for key, orig in cols_up.items()
+                    if "NIVEL" in key and "FORMAC" in key and not key.startswith("ID")
+                ),
+                None,
+            )
+            col_pc = next((orig for key, orig in cols_up.items() if "PRIMER" in key), None)
+            col_sec = next(
+                (
+                    orig
+                    for key, orig in cols_up.items()
+                    if "SECTOR" in key and "IES" in key and not key.startswith("ID")
+                ),
+                None,
+            )
+            col_mod = next(
+                (
+                    orig
+                    for key, orig in cols_up.items()
+                    if key in ("METODOLOGÍA", "MODALIDAD", "METODOLOGIA")
+                    and not key.startswith("ID")
+                ),
+                None,
+            )
+            if col_mod is None:
+                col_mod = next(
+                    (
+                        orig
+                        for key, orig in cols_up.items()
+                        if "METODOL" in key and not key.startswith("ID")
+                    ),
+                    None,
+                )
+            col_dpto = next(
+                (orig for key, orig in cols_up.items() if "DEPARTAMENTO" in key and "OFERTA" in key),
+                None,
+            )
+
+            if not col_niv or not col_pc:
+                log_warning(f"[Crecimiento] {yr}: columnas nivel/pc no encontradas.")
+                return None
+
+            out = pd.DataFrame()
+            out["NIVEL"] = df_raw[col_niv].astype(str).str.strip().str.upper()
+            out["PC"] = pd.to_numeric(df_raw[col_pc], errors="coerce").fillna(0)
+            out["SECTOR"] = (
+                df_raw[col_sec].apply(_norm_sector) if col_sec else "DESCONOCIDO"
+            )
+            out["MOD"] = (
+                df_raw[col_mod].apply(_norm_modalidad) if col_mod else "PRESENCIAL"
+            )
+            out["DPTO"] = (
+                df_raw[col_dpto].apply(_norm_dpto) if col_dpto else ""
+            )
+            mask = out["NIVEL"].str.contains("ESPECIALI|MAESTR", na=False)
+            return out[mask].copy()
+
+        except Exception as e:
+            log_warning(f"[Crecimiento] {yr}: error al leer — {e}")
+            return None
+
+    datos: dict[int, pd.DataFrame | None] = {}
+    for yr in años:
+        datos[yr] = _cargar_año(yr)
+        if datos[yr] is not None:
+            log_info(f"[Crecimiento] {yr}: {len(datos[yr]):,} filas cargadas.")
+
+    def _cagr(serie: dict[int, float], y0: int, y1: int) -> float | None:
+        v0 = serie.get(y0, 0) or 0
+        v1 = serie.get(y1, 0) or 0
+        n = y1 - y0
+        if v0 <= 0 or v1 <= 0 or n <= 0:
+            return None
+        return round((v1 / v0) ** (1 / n) - 1, 4)
+
+    def _suma_serie(
+        sec_filter: str | None,
+        mod_filter: list[str],
+        dpto_filter: list[str] | None,
+        nivel_contains: str,
+    ) -> dict[int, float]:
+        serie: dict[int, float] = {}
+        for yr in años:
+            df_yr = datos.get(yr)
+            if df_yr is None or df_yr.empty:
+                serie[yr] = 0.0
+                continue
+            mask = df_yr["NIVEL"].str.contains(nivel_contains, na=False)
+            if sec_filter:
+                mask &= df_yr["SECTOR"] == sec_filter
+            if mod_filter:
+                mask &= df_yr["MOD"].isin(mod_filter)
+            if dpto_filter:
+                dptos_norm = [_norm_dpto(d) for d in dpto_filter]
+                mask &= df_yr["DPTO"].isin(dptos_norm)
+            serie[yr] = float(df_yr.loc[mask, "PC"].sum())
+        return serie
+
+    COMBOS = [
+        (
+            "Colombia — Todo el mercado",
+            None,
+            ["PRESENCIAL", "VIRTUAL", "A DISTANCIA", "HIBRIDA"],
+            None,
+        ),
+        (
+            "Colombia — No Virtual · Todos sectores",
+            None,
+            ["PRESENCIAL", "A DISTANCIA", "HIBRIDA"],
+            None,
+        ),
+        (
+            "Colombia — Presencial puro · Todos sectores",
+            None,
+            ["PRESENCIAL"],
+            None,
+        ),
+        (
+            "Colombia — Virtual · Todos sectores",
+            None,
+            ["VIRTUAL"],
+            None,
+        ),
+        (
+            "Colombia — Privada · Presencial puro",
+            "PRIVADA",
+            ["PRESENCIAL"],
+            None,
+        ),
+        (
+            "Colombia — Privada · Virtual",
+            "PRIVADA",
+            ["VIRTUAL"],
+            None,
+        ),
+        (
+            "Antioquia — Todo el mercado",
+            None,
+            ["PRESENCIAL", "VIRTUAL", "A DISTANCIA", "HIBRIDA"],
+            ["ANTIOQUIA"],
+        ),
+        (
+            "Bogotá — Todo el mercado",
+            None,
+            ["PRESENCIAL", "VIRTUAL", "A DISTANCIA", "HIBRIDA"],
+            ["BOGOTÁ D.C.", "BOGOTA D.C."],
+        ),
+        (
+            "Eje Cafetero — Todo el mercado",
+            None,
+            ["PRESENCIAL", "VIRTUAL", "A DISTANCIA", "HIBRIDA"],
+            ["CALDAS", "RISARALDA", "QUINDÍO"],
+        ),
+    ]
+
+    filas: list[dict] = []
+    for nombre, sec_f, mod_f, dpto_f in COMBOS:
+        serie_esp = _suma_serie(sec_f, mod_f, dpto_f, "ESPECIALI")
+        serie_mae = _suma_serie(sec_f, mod_f, dpto_f, "MAESTR")
+        serie_tot = {yr: serie_esp[yr] + serie_mae[yr] for yr in años}
+
+        sector_txt = sec_f if sec_f else "(Todos)"
+        mod_txt = " · ".join(mod_f) if mod_f else "(Todas)"
+        dpto_txt = ", ".join(dpto_f) if dpto_f else "(Todos)"
+
+        filas.append({"__tipo": "header", "__campo": "SEGMENTO", "__valor": nombre})
+        filas.append({"__tipo": "header", "__campo": "SECTOR IES", "__valor": sector_txt})
+        filas.append({"__tipo": "header", "__campo": "METODOLOGÍA", "__valor": mod_txt})
+        filas.append({"__tipo": "header", "__campo": "DEPARTAMENTO", "__valor": dpto_txt})
+        filas.append({"__tipo": "blank"})
+
+        for nivel_label, serie in [
+            ("ESPECIALIZACIÓN", serie_esp),
+            ("MAESTRÍA", serie_mae),
+            ("Total", serie_tot),
+        ]:
+            fila: dict = {"__tipo": "data", "NIVEL": nivel_label}
+            total_fila = 0.0
+            for yr in años:
+                v = serie.get(yr, 0) or 0
+                fila[str(yr)] = v if v > 0 else None
+                if v:
+                    total_fila += v
+            fila["Total general"] = total_fila if total_fila > 0 else None
+            fila[f"CAGR {yr_ini}-{yr_fin}"] = _cagr(serie, yr_ini, yr_fin)
+            fila["CAGR 2019-2024"] = _cagr(serie, 2019, yr_fin)
+            fila["CAGR 2021-2024"] = _cagr(serie, 2021, yr_fin)
+            filas.append(fila)
+
+        filas.append({"__tipo": "blank"})
+
+    return pd.DataFrame(filas)
 
 
 def run_fase_valorizacion(log: Callable = print) -> Path:
@@ -1236,6 +1574,12 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
         df_out.to_excel(writer, sheet_name="Valorizacion", index=False)
         _formatear_hoja_valorizacion(writer, df_out)
 
+        # ── Hoja 2: Crecimiento de Mercado ───────────────────────────
+        df_crec = _construir_tabla_crecimiento(sabana_ref)
+        ws_crec = writer.book.create_sheet("Crecimiento_Mercado")
+        writer.sheets["Crecimiento_Mercado"] = ws_crec
+        _formatear_hoja_crecimiento(writer, df_crec)
+
     log(f"✓ Generado: {ruta}")
     return ruta
 
@@ -1523,3 +1867,133 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
 
     ws.freeze_panes = "H3"
     ws.auto_filter.ref = f"A2:{get_column_letter(len(cols))}{2 + len(df_out)}"
+
+
+def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
+    """
+    Formatea la hoja Crecimiento_Mercado con bloques de cabecera + datos.
+    Cada combo: 4 filas de cabecera + 1 blank + 3 datos + 1 blank.
+    """
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    ws = writer.sheets["Crecimiento_Mercado"]
+
+    COLOR_HEADER_BG = "1C3557"
+    COLOR_HEADER_FG = "FFFFFF"
+    COLOR_TOTAL_BG = "D9E1F2"
+    COLOR_ESP_BG = "EBF9EE"
+    COLOR_MAE_BG = "FFFDE7"
+    COLOR_COL_HEADER = "37474F"
+
+    FMT_NUM = "#,##0"
+    FMT_PCT = "0.0%"
+
+    años_cols = [str(yr) for yr in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1)]
+    yr_ini = AÑO_INICIO_PRIMER_CURSO
+    yr_fin = AÑO_FIN_DATOS
+    all_cols = años_cols + [
+        "Total general",
+        f"CAGR {yr_ini}-{yr_fin}",
+        "CAGR 2019-2024",
+        "CAGR 2021-2024",
+    ]
+    last_col = len(all_cols) + 1
+
+    if ws.max_row:
+        ws.delete_rows(1, ws.max_row)
+
+    hdr_fill = PatternFill("solid", fgColor=COLOR_COL_HEADER)
+    hdr_font = Font(bold=True, color=COLOR_HEADER_FG, name="Arial", size=9)
+
+    ws.cell(row=1, column=1, value="SEGMENTO / NIVEL")
+    ws.cell(row=1, column=1).font = hdr_font
+    ws.cell(row=1, column=1).fill = hdr_fill
+    ws.cell(row=1, column=1).alignment = Alignment(
+        horizontal="left", vertical="center"
+    )
+
+    for j, col in enumerate(all_cols, start=2):
+        cell = ws.cell(row=1, column=j, value=col)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        if "CAGR" in str(col):
+            cell.number_format = FMT_PCT
+
+    ws.row_dimensions[1].height = 22
+    ws.freeze_panes = "B2"
+
+    section_fill = PatternFill("solid", fgColor=COLOR_HEADER_BG)
+    section_font_bold = Font(bold=True, color=COLOR_HEADER_FG, name="Arial", size=9)
+    section_font_val = Font(color=COLOR_HEADER_FG, name="Arial", size=9)
+
+    current_row = 2
+    for _, fila in df.iterrows():
+        tipo = fila.get("__tipo", "data")
+
+        if tipo == "blank":
+            current_row += 1
+            continue
+
+        if tipo == "header":
+            campo = fila.get("__campo", "")
+            valor = fila.get("__valor", "")
+            c1 = ws.cell(row=current_row, column=1, value=campo)
+            c1.font = section_font_bold
+            c1.fill = section_fill
+            c2 = ws.cell(row=current_row, column=2, value=valor)
+            c2.font = section_font_val
+            c2.fill = section_fill
+            ws.merge_cells(
+                start_row=current_row,
+                start_column=2,
+                end_row=current_row,
+                end_column=last_col,
+            )
+            ws.row_dimensions[current_row].height = 15
+            current_row += 1
+            continue
+
+        if tipo == "data":
+            nivel = fila.get("NIVEL", "")
+            if nivel == "Total":
+                bg = COLOR_TOTAL_BG
+                bold = True
+            elif "ESPECIALI" in str(nivel).upper():
+                bg = COLOR_ESP_BG
+                bold = False
+            else:
+                bg = COLOR_MAE_BG
+                bold = False
+
+            fill = PatternFill("solid", fgColor=bg)
+            c0 = ws.cell(row=current_row, column=1, value=nivel)
+            c0.font = Font(bold=bold, name="Arial", size=10)
+            c0.fill = fill
+            c0.alignment = Alignment(horizontal="left", vertical="center")
+
+            for j, col in enumerate(all_cols, start=2):
+                v = fila.get(col, None)
+                cell = ws.cell(
+                    row=current_row,
+                    column=j,
+                    value=v if v is not None and pd.notna(v) else None,
+                )
+                cell.fill = fill
+                cell.font = Font(bold=bold, name="Arial", size=10)
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+                if "CAGR" in col:
+                    cell.number_format = FMT_PCT
+                else:
+                    cell.number_format = FMT_NUM
+
+            ws.row_dimensions[current_row].height = 16
+            current_row += 1
+
+    ws.column_dimensions["A"].width = 42
+    for j in range(2, last_col + 1):
+        letter = get_column_letter(j)
+        ws.column_dimensions[letter].width = 10 if j <= len(años_cols) + 1 else 12
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}1"
