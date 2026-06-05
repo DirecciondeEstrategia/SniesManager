@@ -292,7 +292,13 @@ assert (
 )
 
 # ── Análisis regional ────────────────────────────────────────────────────────
-UMBRAL_REGIONAL_MATRICULA: int = 50
+# Umbral mínimo de nuevos matriculados (primer_curso) que debe tener una celda
+# (categoría × departamento) en el último año para que se calculen sus métricas
+# de crecimiento regional. Celdas por debajo se marcan DATOS_INSUFICIENTES=True.
+# Calibración: el umbral anterior era 50 sobre matrícula total. Primer_curso es
+# ~5× menor que matrícula total en posgrado → equivalente ≈ 10.
+# Se usa 10 para balancear cobertura vs. ruido estadístico en celdas pequeñas.
+UMBRAL_REGIONAL_PRIMER_CURSO: int = 10
 
 # Valores históricos conocidos del SMLMV por año calendario.
 # El año corriente usará obtener_smlmv_vigente(), salvo que se haga override en sesión.

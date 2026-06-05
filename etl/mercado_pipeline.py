@@ -44,7 +44,7 @@ from etl.config import (
     NIVELES_PREGRADO,
     RAW_HISTORIC_DIR,
     REF_DIR,
-    UMBRAL_REGIONAL_MATRICULA,
+    UMBRAL_REGIONAL_PRIMER_CURSO,
     get_benchmark_costo,
     get_smlmv_sesion,
 )
@@ -1055,7 +1055,7 @@ def _cargar_ole_indicadores(raw_dir: Path, ref_dir: Path) -> tuple[pd.DataFrame,
 
     log_warning(
         "[Fase 3] No se encontró ole_indicadores.csv en ninguna fuente. "
-        "TASA_COTIZANTES y SALARIO_OLE serán imputados por mediana de categoría."
+        "TASA_COTIZANTES y SALARIO_OLE quedarán sin dato (FUENTE_OLE=SIN_DATO)."
     )
     return pd.DataFrame(columns=COLS_OUT), "NONE"
 
@@ -1362,7 +1362,7 @@ def run_fase3() -> None:
             pct = (n_con_datos / n_total) if n_total else 0
             log_info(f"[Fase 3] {col}: {n_con_datos:,} programas con dato real de {n_total:,} ({pct:.0%})")
 
-    # 3.2 OLE en cascada: REFERENTE → SCRAPER → IMPUTADO (mediana por CATEGORIA_FINAL)
+    # 3.2 OLE en cascada: REFERENTE → SCRAPER/BACKUP → SIN_DATO (sin imputación)
     if "FUENTE_OLE" not in base.columns:
         base["FUENTE_OLE"] = pd.NA
     tiene_ref = base["TASA_COTIZANTES"].notna() | base["SALARIO_OLE"].notna()
@@ -1383,13 +1383,12 @@ def run_fase3() -> None:
         ] = fuente_ole if fuente_ole in ("SCRAPER", "BACKUP") else "SCRAPER"
         base = base.drop(columns=["_ole_tasa", "_ole_salario"], errors="ignore")
 
-    mask_imputar_ole = base["FUENTE_OLE"].isna()
-    if mask_imputar_ole.any() and "CATEGORIA_FINAL" in base.columns:
-        for col_ole in ["TASA_COTIZANTES", "SALARIO_OLE"]:
-            medianas = base.groupby("CATEGORIA_FINAL")[col_ole].transform("median")
-            base.loc[mask_imputar_ole, col_ole] = base.loc[mask_imputar_ole, col_ole].fillna(medianas[mask_imputar_ole])
-        base.loc[mask_imputar_ole, "FUENTE_OLE"] = "IMPUTADO"
-    base["FUENTE_OLE"] = base["FUENTE_OLE"].fillna("IMPUTADO")
+    # Sin imputación: si no hay dato OLE, el salario queda en NaN → score_salario = 1.
+    # Los pesos ponderados absorben correctamente la ausencia del dato.
+    # Solo marcar la fuente para trazabilidad.
+    mask_sin_ole_final = base["FUENTE_OLE"].isna()
+    if mask_sin_ole_final.any():
+        base.loc[mask_sin_ole_final, "FUENTE_OLE"] = "SIN_DATO"
 
     # Logs detallados de OLE
     total_prog = len(base)
@@ -1398,26 +1397,22 @@ def run_fase3() -> None:
         n_ref = int(fuente_counts.get("REFERENTE", 0))
         n_scr = int(fuente_counts.get("SCRAPER", 0))
         n_bak = int(fuente_counts.get("BACKUP", 0))
-        n_imp = int(fuente_counts.get("IMPUTADO", 0))
+        n_sin = int(fuente_counts.get("SIN_DATO", 0))
         log_info(
-            f"OLE — Referente: {n_ref} | Scraper: {n_scr} | Backup: {n_bak} | Imputado: {n_imp} "
+            f"OLE — Referente: {n_ref} | Scraper: {n_scr} | Backup: {n_bak} | Sin dato: {n_sin} "
             f"(total: {total_prog} programas)"
         )
-        if "CATEGORIA_FINAL" in base.columns and n_imp:
-            df_imp_ole = base[base["FUENTE_OLE"] == "IMPUTADO"]
-            if not df_imp_ole.empty:
-                imp_por_cat = df_imp_ole.groupby("CATEGORIA_FINAL")["FUENTE_OLE"].count()
+        if "CATEGORIA_FINAL" in base.columns and n_sin:
+            df_sin_ole = base[base["FUENTE_OLE"] == "SIN_DATO"]
+            if not df_sin_ole.empty:
+                sin_por_cat = df_sin_ole.groupby("CATEGORIA_FINAL")["FUENTE_OLE"].count()
                 total_por_cat = base.groupby("CATEGORIA_FINAL")["FUENTE_OLE"].count()
-                top_imp = imp_por_cat.sort_values(ascending=False).head(5)
-                log_info("Top 5 categorías con más imputación OLE:")
-                for cat, cnt in top_imp.items():
+                top_sin = sin_por_cat.sort_values(ascending=False).head(5)
+                log_info("Top 5 categorías con más programas sin dato OLE:")
+                for cat, cnt in top_sin.items():
                     total_cat = int(total_por_cat.get(cat, 0))
                     pct = (cnt / total_cat * 100) if total_cat else 0
-                    log_info(f"  · {cat}: {cnt} imputados de {total_cat} ({pct:.1f}%)")
-                    if total_cat and (cnt / total_cat) > 0.80:
-                        log_warning(
-                            f"⚠️ Categoría '{cat}' tiene {pct:.1f}% de datos OLE imputados — baja confiabilidad."
-                        )
+                    log_info(f"  · {cat}: {cnt} sin dato de {total_cat} ({pct:.1f}%)")
 
     # 3.3 Costo de matrícula: base → Cobertura (Principal) → mediana por categoría
     costo_col = "COSTO_MATRÍCULA_ESTUD_NUEVOS"
@@ -1553,9 +1548,66 @@ def run_fase3() -> None:
                 f"({pct * 100:.1f}% programas con valor > 0). Coloca los archivos en ref/backup/matriculas/."
             )
 
+    # AAGR_ROBUSTO por programa — requerido por valorizacion_pipeline._metricas_de_subconjunto()
+    def _aagr_robusto_por_programa(df_prog: pd.DataFrame) -> pd.Series:
+        col_nivel = "NIVEL_DE_FORMACIÓN"
+        pc_ini = df_prog.get(
+            f"primer_curso_{AÑO_INICIO_HISTORICO}",
+            pd.Series(0, index=df_prog.index),
+        ).fillna(0)
+        pc_fin = df_prog.get(
+            f"primer_curso_{AÑO_FIN_DATOS}",
+            pd.Series(0, index=df_prog.index),
+        ).fillna(0)
+        nivel = df_prog.get(
+            col_nivel,
+            pd.Series("ESPECIALIZACIÓN", index=df_prog.index),
+        ).fillna("ESPECIALIZACIÓN")
+
+        def _umbral(n: str) -> int:
+            u = str(n).strip().upper()
+            if "MAEST" in u:
+                return 15
+            if "UNIVER" in u:
+                return 100
+            return 30
+
+        umbral = nivel.apply(_umbral)
+
+        vars_pc = []
+        for _y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
+            c_c = f"primer_curso_{_y}"
+            c_p = f"primer_curso_{_y - 1}"
+            if c_c in df_prog.columns and c_p in df_prog.columns:
+                den = df_prog[c_p].replace(0, np.nan)
+                vars_pc.append((df_prog[c_c] - df_prog[c_p]) / den)
+        aagr = (
+            pd.concat(vars_pc, axis=1).mean(axis=1)
+            if vars_pc
+            else pd.Series(np.nan, index=df_prog.index)
+        )
+
+        n_years = max(AÑO_FIN_DATOS - AÑO_INICIO_HISTORICO, 1)
+        mask_pos = (pc_ini > 0) & (pc_fin > 0)
+        cagr = pd.Series(np.nan, index=df_prog.index)
+        cagr[mask_pos] = (pc_fin[mask_pos] / pc_ini[mask_pos]) ** (1 / n_years) - 1
+
+        result = aagr.copy()
+        mask_bp = (pc_ini > 0) & (pc_ini < umbral) & cagr.notna()
+        result[mask_bp] = cagr[mask_bp]
+        result[(pc_fin == 0) & (pc_ini > 0)] = -1.0
+        result[(pc_fin == 0) & (pc_ini == 0)] = np.nan
+        return result.rename("AAGR_ROBUSTO")
+
+    if "AAGR_ROBUSTO" not in base.columns:
+        base["AAGR_ROBUSTO"] = _aagr_robusto_por_programa(base)
+        log_info(
+            f"[Fase 3] AAGR_ROBUSTO por programa: {base['AAGR_ROBUSTO'].notna().sum():,} con dato"
+        )
+
     # 3.5 Guardar sábana y log
     sabana_path = CHECKPOINT_BASE_MAESTRA.parent / "sabana_consolidada.parquet"
-    SCHEMA_VERSION = "v3"
+    SCHEMA_VERSION = "v4"
     base["schema_version"] = SCHEMA_VERSION
     base.to_parquet(sabana_path, index=False)
     n = len(base)
@@ -1656,7 +1708,16 @@ def run_fase4_desde_sabana(
         c = f"primer_curso_{y}"
         if c in df.columns:
             simple_agg[f"suma_primer_curso_{y}"] = pd.NamedAgg(column=c, aggfunc="sum")
-            simple_agg[f"prom_primer_curso_{y}"] = pd.NamedAgg(column=c, aggfunc="mean")
+            # FIX 24: denominador = solo registros con primer_curso > 0 ese año.
+            # Antes: mean sobre todos los registros (incluye PC=0) → denominador fijo
+            #        → var_prom = var_suma algebraicamente → AAGR_prom = AAGR_suma siempre.
+            # Ahora: mean sobre registros activos → denominador variable → AAGR_prom ≠ AAGR_suma
+            #        cuando programas entran o salen de la categoría entre años.
+            # Interpretación: "promedio de nuevos matriculados por programa ACTIVO ese año".
+            simple_agg[f"prom_primer_curso_{y}"] = pd.NamedAgg(
+                column=c,
+                aggfunc=lambda x: x[x > 0].mean(),
+            )
 
     for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         c = f"graduados_{y}"
@@ -1711,6 +1772,13 @@ def run_fase4_desde_sabana(
             den = ag[c_prev].replace(0, np.nan)
             ag[f"var_primer_curso_{y}"] = (ag[c_curr] - ag[c_prev]) / den
 
+    for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
+        c_curr_p = f"prom_primer_curso_{y}"
+        c_prev_p = f"prom_primer_curso_{y-1}"
+        if c_curr_p in ag.columns and c_prev_p in ag.columns:
+            den_p = ag[c_prev_p].replace(0, np.nan)
+            ag[f"var_prom_primer_curso_{y}"] = (ag[c_curr_p] - ag[c_prev_p]) / den_p
+
     var_pc_cols = [
         f"var_primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1) if f"var_primer_curso_{y}" in ag.columns
     ]
@@ -1739,12 +1807,25 @@ def run_fase4_desde_sabana(
             den_p = p_prev.replace(0, np.nan)
             ag[f"var_prom_{y}"] = (p_curr - p_prev) / den_p
 
-    # participacion_2019 — mantiene matrícula total como referencia histórica
-    total_prom_2019 = ag[f"prom_matricula_{AÑO_INICIO_HISTORICO}"].sum() if f"prom_matricula_{AÑO_INICIO_HISTORICO}" in ag.columns else 0
-    if total_prom_2019 and total_prom_2019 != 0:
-        ag[f"participacion_{AÑO_INICIO_HISTORICO}"] = ag[f"prom_matricula_{AÑO_INICIO_HISTORICO}"] / total_prom_2019
+    # participacion_2019 — sobre primer_curso (consistente con participacion_2024)
+    _col_pc_ini = f"suma_primer_curso_{AÑO_INICIO_HISTORICO}"
+    if _col_pc_ini in ag.columns:
+        _total_pc_ini = ag[_col_pc_ini].sum()
+        if _total_pc_ini and _total_pc_ini != 0:
+            ag[f"participacion_{AÑO_INICIO_HISTORICO}"] = ag[_col_pc_ini] / _total_pc_ini
+        else:
+            ag[f"participacion_{AÑO_INICIO_HISTORICO}"] = np.nan
+            log_warning(
+                f"[Fase 4] participacion_{AÑO_INICIO_HISTORICO} = NaN para todas las categorías. "
+                f"Verificar que primer_curso_{AÑO_INICIO_HISTORICO}.xlsx exista en ref/backup/."
+            )
     else:
         ag[f"participacion_{AÑO_INICIO_HISTORICO}"] = np.nan
+        log_warning(
+            f"[Fase 4] No existe columna suma_primer_curso_{AÑO_INICIO_HISTORICO}. "
+            f"participacion_{AÑO_INICIO_HISTORICO} quedará vacía. "
+            f"Verificar que primer_curso_{AÑO_INICIO_HISTORICO}.xlsx exista en ref/backup/."
+        )
 
     # participacion_2024 — sobre primer_curso (peso relativo del flujo de nuevos)
     if f"prom_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
@@ -1760,24 +1841,34 @@ def run_fase4_desde_sabana(
             if total_prom_2024 != 0 else np.nan
         )
 
-    # AAGR_suma y AAGR_prom
-    var_suma_cols = [f"var_suma_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1) if f"var_suma_{y}" in ag.columns]
-    var_prom_cols = [f"var_prom_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1) if f"var_prom_{y}" in ag.columns]
-    ag["AAGR_suma"] = ag[var_suma_cols].mean(axis=1) if var_suma_cols else np.nan
-    ag["AAGR_prom"] = ag[var_prom_cols].mean(axis=1) if var_prom_cols else np.nan
+    # AAGR_suma — promedio de variaciones anuales de PRIMER CURSO (no matrícula total)
+    var_pc_sum_cols = [
+        f"var_primer_curso_{y}"
+        for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
+        if f"var_primer_curso_{y}" in ag.columns
+    ]
+    ag["AAGR_suma"] = ag[var_pc_sum_cols].mean(axis=1) if var_pc_sum_cols else np.nan
+    _var_prom_pc_cols = [
+        f"var_prom_primer_curso_{y}"
+        for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
+        if f"var_prom_primer_curso_{y}" in ag.columns
+    ]
+    ag["AAGR_prom"] = ag[_var_prom_pc_cols].mean(axis=1) if _var_prom_pc_cols else np.nan
 
-    # CAGR_suma requiere suma_matricula del primer y último año del histórico
+    # CAGR_suma — tasa compuesta sobre primer_curso (demanda nueva)
     ag["CAGR_suma"] = np.nan
     _n_years_cagr = max(AÑO_FIN_DATOS - AÑO_INICIO_HISTORICO, 1)
-    if f"suma_matricula_{AÑO_INICIO_HISTORICO}" in ag.columns and f"suma_matricula_{AÑO_FIN_DATOS}" in ag.columns:
-        suma_2019 = ag[f"suma_matricula_{AÑO_INICIO_HISTORICO}"]
-        suma_2024 = ag[f"suma_matricula_{AÑO_FIN_DATOS}"]
-        mask_cagr = (suma_2019 > 0) & (suma_2024 > 0)
-        ag.loc[mask_cagr, "CAGR_suma"] = (
-            suma_2024[mask_cagr] / suma_2019[mask_cagr]
+    _col_pc_ini = f"suma_primer_curso_{AÑO_INICIO_HISTORICO}"
+    _col_pc_fin = f"suma_primer_curso_{AÑO_FIN_DATOS}"
+    if _col_pc_ini in ag.columns and _col_pc_fin in ag.columns:
+        _pc_ini = ag[_col_pc_ini]
+        _pc_fin = ag[_col_pc_fin]
+        _mask_cagr = (_pc_ini > 0) & (_pc_fin > 0)
+        ag.loc[_mask_cagr, "CAGR_suma"] = (
+            _pc_fin[_mask_cagr] / _pc_ini[_mask_cagr]
         ) ** (1 / _n_years_cagr) - 1
 
-    # CAGR_primer_curso — tasa compuesta sobre flujo de nuevos matriculados
+    # CAGR_primer_curso — idéntico a CAGR_suma; se mantienen ambos nombres por compatibilidad
     ag["CAGR_primer_curso"] = np.nan
     if f"suma_primer_curso_{AÑO_INICIO_HISTORICO}" in ag.columns and f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
         pc_2019 = ag[f"suma_primer_curso_{AÑO_INICIO_HISTORICO}"]
@@ -1967,24 +2058,44 @@ def run_fase4_desde_sabana(
     # y siempre supera a inscritos (ratio típico: ins/mat ≈ 0.3–0.7).
 
     def _calc_pct_vs_pc(ins_col: str, pc_col: str) -> "pd.Series":
-        """pct = (inscritos - primer_curso) / inscritos, clip [0, 1]."""
+        """
+        pct = (inscritos - primer_curso) / inscritos, rango [0, 1].
+        Si inscritos < primer_curso → NaN (dato SNIES incoherente, no se imputa).
+        Si inscritos = 0 → NaN (sin denominador).
+        """
         if ins_col not in ag.columns or pc_col not in ag.columns:
             return pd.Series(np.nan, index=ag.index)
-        ins = pd.to_numeric(ag[ins_col], errors="coerce").fillna(0)
-        pc = pd.to_numeric(ag[pc_col], errors="coerce").fillna(0)
+        ins = pd.to_numeric(ag[ins_col], errors="coerce")
+        pc = pd.to_numeric(ag[pc_col], errors="coerce")
         den = ins.replace(0, np.nan)
-        return ((ins - pc) / den).clip(lower=0, upper=1)
+        raw = (ins - pc) / den
+        mask_invalido = ins.notna() & pc.notna() & (ins < pc)
+        raw = raw.where(~mask_invalido, other=np.nan)
+        return raw.clip(lower=0, upper=1)
 
     # pct_no_matriculados_2023
     ag[f"pct_no_matriculados_{AÑO_FIN_DATOS - 1}"] = _calc_pct_vs_pc(
         f"inscritos_{AÑO_FIN_DATOS - 1}_suma", f"suma_primer_curso_{AÑO_FIN_DATOS - 1}"
     )
 
-    # pct_no_matriculados_2024 — prioridad 2024, fallback 2023
+    # pct_no_matriculados_2024 — prioridad 2024, fallback 2023 (solo si falta dato, no si incoherente)
     pct_2024 = _calc_pct_vs_pc(f"inscritos_{AÑO_FIN_DATOS}_suma", f"suma_primer_curso_{AÑO_FIN_DATOS}")
     pct_2023 = _calc_pct_vs_pc(f"inscritos_{AÑO_FIN_DATOS - 1}_suma", f"suma_primer_curso_{AÑO_FIN_DATOS - 1}")
 
-    ag[f"pct_no_matriculados_{AÑO_FIN_DATOS}"] = pct_2024.combine_first(pct_2023)
+    _col_ins_24 = f"inscritos_{AÑO_FIN_DATOS}_suma"
+    _col_pc_24 = f"suma_primer_curso_{AÑO_FIN_DATOS}"
+    _ins_24 = pd.to_numeric(ag.get(_col_ins_24, pd.Series(np.nan, index=ag.index)), errors="coerce")
+    _pc_24 = pd.to_numeric(ag.get(_col_pc_24, pd.Series(np.nan, index=ag.index)), errors="coerce")
+    _mask_inv_2024 = _ins_24.notna() & _pc_24.notna() & (_ins_24 < _pc_24)
+    _pct_combined = pct_2024.combine_first(pct_2023)
+    _pct_combined = _pct_combined.where(~_mask_inv_2024, other=np.nan)
+    ag[f"pct_no_matriculados_{AÑO_FIN_DATOS}"] = _pct_combined
+    if _mask_inv_2024.any():
+        log_warning(
+            f"[Consistencia] {_mask_inv_2024.sum()} categorías con "
+            f"inscritos_{AÑO_FIN_DATOS} < primer_curso_{AÑO_FIN_DATOS} — "
+            f"pct_no_matriculados_{AÑO_FIN_DATOS} = NaN (no se usa fallback 2023)."
+        )
 
     # FUENTE: basado en si inscritos_suma > 0 (no en coherencia ins>=mat)
     ins24_ok = ag.get(f"inscritos_{AÑO_FIN_DATOS}_suma", pd.Series(0, index=ag.index))
@@ -2038,12 +2149,18 @@ def run_fase4_desde_sabana(
         # El clip evita que 5 categorías con crecimiento >200% distorsionen el promedio.
     else:
         ag["var_programas"] = np.nan
-    if "programas_activos" in ag.columns:
-        ag["pct_con_matricula"] = ag[f"num_programas_{AÑO_FIN_DATOS}"] / ag["programas_activos"].replace(0, np.nan)
+    if "programas_activos" in ag.columns and "programas_inactivos" in ag.columns:
+        _total_registros = ag["programas_activos"] + ag["programas_inactivos"]
+        ag["pct_con_matricula"] = (
+            ag["programas_activos"] / _total_registros.replace(0, np.nan)
+        )
+        ag["pct_con_matricula"] = ag["pct_con_matricula"].clip(0, 1)
     else:
         ag["pct_con_matricula"] = np.nan
-    # prom_matricula_por_programa_2024 — ahora es prom de nuevos matriculados por programa.
-    # Mantener el nombre para compatibilidad con scoring.py y valorizacion_pipeline.py.
+    # NOTA: prom_matricula_por_programa_XXXX es un alias de prom_primer_curso_XXXX.
+    # El nombre se mantiene por compatibilidad con scoring.py y valorizacion_pipeline.py.
+    # Semánticamente representa "nuevos matriculados promedio por registro SNIES",
+    # no "matrícula total promedio". Ver Fix 11 y Fix 20.
     if f"prom_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
         ag[f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"] = ag[f"prom_primer_curso_{AÑO_FIN_DATOS}"]
     elif f"num_programas_{AÑO_FIN_DATOS}" in ag.columns and f"suma_matricula_{AÑO_FIN_DATOS}" in ag.columns:
@@ -2081,6 +2198,7 @@ def run_fase4_desde_sabana(
         ag["distancia_costo_pct"] = np.nan
 
     # salario_promedio ya viene expresado en SMLMV (ej. 3.5). No dividir por SMLMV en pesos.
+    # NaN en salario_promedio (sin OLE) se propaga sin fillna → score_salario = 1.
     if "salario_promedio" in ag.columns:
         ag["salario_promedio_smlmv"] = ag["salario_promedio"]
         smlmv = float(get_smlmv_sesion())
@@ -2094,6 +2212,11 @@ def run_fase4_desde_sabana(
 
     # Bloque E: scoring
     ag = apply_scoring(ag, modo_local=modo_local, universo=universo)
+
+    # Restaurar NaN en export para inscritos < primer_curso (scoring usa fillna 0.25 interno)
+    _col_pct_nm = f"pct_no_matriculados_{AÑO_FIN_DATOS}"
+    if _col_pct_nm in ag.columns and _mask_inv_2024.any():
+        ag.loc[_mask_inv_2024, _col_pct_nm] = np.nan
 
     # CAT_ID — identificador estable de categoría desde registro permanente
     if "CATEGORIA_FINAL" in ag.columns:
@@ -2127,7 +2250,7 @@ def run_fase4() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
         log_error("No existe sábana consolidada. Ejecutar Fase 3 antes.")
         return None, None
     df = pd.read_parquet(sabana_path)
-    SCHEMA_VERSION = "v3"
+    SCHEMA_VERSION = "v4"
     if "schema_version" in df.columns:
         sv = str(df["schema_version"].iloc[0]) if len(df) else ""
         if sv and sv != SCHEMA_VERSION:
@@ -2150,6 +2273,8 @@ def run_fase4() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     # ── Invalidar cachés si scoring.py es más reciente ────────────────────────
     _cache_invalida(out_path)
     _cache_invalida(out_path_pre)
+    for _seg in ["Antioquia", "Bogota", "Eje_Cafetero", "Virtual", "Colombia"]:
+        _cache_invalida(CHECKPOINT_BASE_MAESTRA.parent / f"agregado_{_seg}.parquet")
 
     # ── Universo posgrado (ESP + MAE, 288 categorías) ─────────────────────────
     ag_pos = run_fase4_desde_sabana(
@@ -2198,94 +2323,75 @@ def run_fase4() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
 
 # Bloques para hoja "total" (encabezado fila 1)
 _BLOQUES_TOTAL = [
-    # ── 0. CATEGORÍA (ID + metadatos) ─────────────────────────────────────
     ("CATEGORÍA", [
-        "CAT_ID",
-        "CATEGORIA_FINAL",
-        "FUENTE_CATEGORIA",
-        "NIVEL_MAYORIT",
+        "CAT_ID", "CATEGORIA_FINAL", "FUENTE_CATEGORIA", "NIVEL_MAYORIT",
     ]),
-    # ── 1. MATRÍCULAS: SUMA ANUAL ─────────────────────────────────────────
-    ("MATRÍCULA SUMA", [
-        f"suma_matricula_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)
-    ]),
-    # ── 2. MATRÍCULAS: PROMEDIO POR PROGRAMA ─────────────────────────────
-    ("MATRÍCULA PROMEDIO", [
-        f"prom_matricula_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)
-    ]),
-    # ── 3. MATRÍCULAS: VARIACIÓN AÑO A AÑO ───────────────────────────────
-    ("VARIACIÓN SUMA", [
-        f"var_suma_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
-    ]),
-    ("VARIACIÓN PROMEDIO", [
-        f"var_prom_{y}" for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
-    ]),
-    # ── 4. PARTICIPACIÓN Y CRECIMIENTO ────────────────────────────────────
-    # (var_yoy_* y diferencial_tendencia se calculan en agregación para SEÑAL_TENDENCIA; no se exportan)
+    ("DEMANDA NUEVA — PRIMER CURSO",
+        [f"suma_primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [f"prom_primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
+        + [
+            f"var_primer_curso_{y}"
+            for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
+        ]
+        + [
+            f"var_prom_primer_curso_{y}"
+            for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)
+        ],
+    ),
     ("PARTICIPACIÓN Y CRECIMIENTO", [
         f"participacion_{AÑO_INICIO_HISTORICO}", f"participacion_{AÑO_FIN_DATOS}",
         "AAGR_suma", "AAGR_prom", "CAGR_suma",
-        "AAGR_ROBUSTO", "TIPO_CRECIMIENTO",
-        "SEÑAL_TENDENCIA",
+        "AAGR_ROBUSTO", "TIPO_CRECIMIENTO", "SEÑAL_TENDENCIA",
     ]),
-    # ── 5. DEMANDA NUEVA ───────────────────────────────────────────────────
-    ("DEMANDA NUEVA",
-        [f"suma_primer_curso_{y}" for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)]
-        + [f"prom_primer_curso_{AÑO_INICIO_HISTORICO}", f"prom_primer_curso_{AÑO_FIN_DATOS}",
-           "AAGR_primer_curso"],
-    ),
-    # ── 6. INSCRITOS ──────────────────────────────────────────────────────
     ("INSCRITOS", [
-        # Totales suma (nivel categoría) — últimos 2 años
         f"inscritos_{AÑO_FIN_DATOS - 1}_suma", f"inscritos_{AÑO_FIN_DATOS}_suma",
-        # Promedio por programa (equivalente al "Prom" del manual de referencia)
         f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa",
         f"inscritos_{AÑO_FIN_DATOS}_prom_por_programa",
-        # Tasa no matriculados
         f"pct_no_matriculados_{AÑO_FIN_DATOS - 1}", f"pct_no_matriculados_{AÑO_FIN_DATOS}",
-        "FUENTE_PCT_NO_MAT",
-        # Variaciones
-        "var_inscritos",
-        "var_inscritos_prom",
+        "FUENTE_PCT_NO_MAT", "var_inscritos", "var_inscritos_prom",
     ]),
-    # ── 7. SALARIO (OLE) ──────────────────────────────────────────────────
-    ("SALARIO", [
-        "salario_promedio",
-        "salario_proyectado_pesos_hoy",
+    ("SALARIO OLE", [
+        "salario_promedio", "salario_proyectado_pesos_hoy",
     ]),
-    # ── 8. OFERTA DE PROGRAMAS ────────────────────────────────────────────
-    ("OFERTA", [
+    ("OFERTA DE PROGRAMAS", [
         f"num_programas_{AÑO_INICIO_HISTORICO}", f"num_programas_{AÑO_FIN_DATOS}",
         "programas_activos", "programas_inactivos",
         "programas_nuevos_3a", "nuevos_vs_snapshot",
         "var_programas", "pct_con_matricula",
     ]),
-    # ── 9. COSTO ──────────────────────────────────────────────────────────
     ("COSTO", [
-        "costo_promedio",
-        "distancia_costo_pct",
+        "costo_promedio", "distancia_costo_pct",
     ]),
-    # ── 10. MATRÍCULAS SEMESTRALES (dato granular, al fondo) ───────────────
-    ("MATRÍCULAS SEMESTRALES", [
-        f"suma_matricula_{y}_{s}"
-        for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)
-        for s in (1, 2)
+    ("SCORING — valor | puntuación", [
+        f"prom_primer_curso_{AÑO_FIN_DATOS}",   "score_matricula",
+        f"participacion_{AÑO_FIN_DATOS}",        "score_participacion",
+        "AAGR_ROBUSTO",                           "score_AAGR",
+        "salario_promedio",                       "score_salario",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}",  "score_pct_no_matriculados",
+        f"num_programas_{AÑO_FIN_DATOS}",         "score_num_programas",
+        "distancia_costo_pct",                    "score_costo",
     ]),
-    # ── 11. BLOQUE SCORING: valor | score lado a lado (igual que referente) ─
-    ("SCORING", [
-        f"prom_primer_curso_{AÑO_FIN_DATOS}",   "score_matricula",   # valor visible = primer_curso
-        f"participacion_{AÑO_FIN_DATOS}", "score_participacion",
-        "AAGR_ROBUSTO", "score_AAGR",
-        "salario_promedio", "score_salario",
-        f"pct_no_matriculados_{AÑO_FIN_DATOS}", "score_pct_no_matriculados",
-        f"num_programas_{AÑO_FIN_DATOS}", "score_num_programas",
-        "costo_promedio", "score_costo",
-    ]),
-    # ── 12. CALIFICACIÓN FINAL (extremo derecho, como en el referente) ────
-    ("CALIFICACIÓN", [
+    ("CALIFICACIÓN FINAL", [
         "calificacion_final",
     ]),
 ]
+
+HEADERS_CONTEXTO_NACIONAL = {
+    "CATEGORIA_FINAL": "Categoría de mercado",
+    "calificacion_final": "Calificación en este segmento (1-5)",
+    "calificacion_nacional": "Calificación Colombia nacional (1-5)",
+    "AAGR_ROBUSTO": "AAGR primer curso en segmento",
+    "AAGR_ROBUSTO_nacional": "AAGR primer curso nacional",
+    f"participacion_{AÑO_FIN_DATOS}": "Participación del segmento en mercado nacional",
+    f"num_programas_{AÑO_FIN_DATOS}": "N° programas en el segmento",
+}
+
+HEADERS_CONTEXTO_NACIONAL.update({
+    f"suma_primer_curso_regional_{AÑO_FIN_DATOS}": (
+        f"Primer curso total segmento {AÑO_FIN_DATOS}"
+    ),
+    f"suma_primer_curso_{AÑO_FIN_DATOS}": f"Primer curso total nacional {AÑO_FIN_DATOS}",
+})
 
 COL_ANCHOS_PROGRAMAS = {
     "CÓDIGO_SNIES_DEL_PROGRAMA": 18,
@@ -2296,6 +2402,270 @@ COL_ANCHOS_PROGRAMAS = {
 VERDE = "C6EFCE"
 AMARILLO = "FFEB9C"
 ROJO = "FFC7CE"
+
+
+def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
+    """
+    Crea la hoja 'estandar_calificacion' con la tabla de umbrales del scoring.
+
+    Propósito: que el analista pueda entender qué significa cada score (1-5)
+    para cada métrica, sin necesidad de abrir scoring.py.
+    Se ubica entre resumen_ejecutivo y total para dar contexto antes de los datos.
+    """
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+
+    ws = writer.book.create_sheet("estandar_calificacion")
+
+    AZUL_OSC = "000066"
+    BLANCO = "FFFFFF"
+    GRIS_CLR = "F5F5F5"
+    SCORE_COLORES = {1: "FFCDD2", 2: "FFE0B2", 3: "FFF9C4", 4: "DCEDC8", 5: "C8E6C9"}
+    SCORE_FUENTE = {1: "B71C1C", 2: "E65100", 3: "827717", 4: "1B5E20", 5: "1B5E20"}
+
+    thin = Side(style="thin", color="BDBDBD")
+    borde = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def _cell(ws, row, col, value, bold=False, bg=None, fg="000000",
+              halign="center", wrap=False, size=10):
+        c = ws.cell(row=row, column=col)
+        c.value = str(value) if value is not None else ""
+        c.data_type = "s"
+        c.font = Font(bold=bold, color=fg, name="Arial", size=size)
+        if bg:
+            c.fill = PatternFill("solid", fgColor=bg)
+        c.alignment = Alignment(horizontal=halign, vertical="center", wrap_text=wrap)
+        c.border = borde
+        return c
+
+    ws.merge_cells("A1:N1")
+    _cell(ws, 1, 1,
+          "ESTÁNDAR DE CALIFICACIÓN — Cómo se evalúa cada categoría de mercado",
+          bold=True, bg=AZUL_OSC, fg=BLANCO, size=12)
+    ws.row_dimensions[1].height = 24
+
+    ws.merge_cells("A2:N2")
+    _cell(ws, 2, 1,
+          "Cada categoría recibe un score de 1 (peor) a 5 (mejor) en 7 métricas. "
+          "La Calificación Final = suma ponderada de los 7 scores. "
+          "Verde ≥ 4.0 · Amarillo 3.0–3.9 · Rojo < 3.0",
+          bold=False, bg="E3F2FD", fg="0D47A1", halign="left", wrap=True, size=10)
+    ws.row_dimensions[2].height = 30
+
+    fila = 4
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(ws, fila, 1, "PESOS DE CADA MÉTRICA EN LA CALIFICACIÓN FINAL",
+          bold=True, bg="37474F", fg=BLANCO, size=10)
+    ws.row_dimensions[fila].height = 20
+    fila += 1
+
+    _yr_fin = AÑO_FIN_DATOS
+    _yr_ant = AÑO_FIN_DATOS - 1
+    pesos_data = [
+        (f"Prom. primer curso {_yr_fin}", "S. Primer curso", "30%",
+         f"Nuevos matriculados promedio por registro SNIES en {_yr_fin}. "
+         "Mide el tamaño de la demanda real del mercado."),
+        ("Participación en mercado", "S. Participación", "15%",
+         "Fracción del mercado nacional que representa esta categoría. "
+         "Quintiles dinámicos del segmento actual."),
+        ("AAGR primer curso (robusto)", "S. AAGR", "20%",
+         f"Crecimiento anual promedio histórico del primer_curso "
+         f"{AÑO_INICIO_HISTORICO}-{_yr_fin}. "
+         f"Usa CAGR para categorías con base pequeña (< 30 estudiantes en {AÑO_INICIO_HISTORICO})."),
+        ("Salario promedio (SMLMV)", "S. Salario", "15%",
+         "Salario promedio de egresados en SMLMV, según OLE. "
+         "Indica el retorno laboral del área de conocimiento."),
+        ("% Inscritos no matriculados", "S. No matr.", "10%",
+         "Fracción de inscritos que no se matricularon. "
+         "Inverso: menos es mejor. Indica conversión de demanda en matrícula."),
+        ("N° programas en mercado", "S. N° Programas", "5%",
+         "Número de programas activos en la categoría. "
+         "Inverso: menos programas = menor competencia = mejor oportunidad."),
+        ("Distancia vs benchmark EAFIT (%)", "S. Costo", "5%",
+         "Cuánto cuesta el mercado vs lo que cobra EAFIT. "
+         "Positivo: el mercado es más caro (EAFIT puede competir). "
+         "Negativo: el mercado es más barato (EAFIT debe revisar precio)."),
+    ]
+
+    for ci, h in enumerate(["Métrica", "Columna score", "Peso", "Descripción"], 1):
+        _cell(ws, fila, ci, h, bold=True, bg="546E7A", fg=BLANCO, size=9)
+    fila += 1
+
+    for i, (metrica, col_score, peso, desc) in enumerate(pesos_data):
+        bg = GRIS_CLR if i % 2 == 0 else BLANCO
+        _cell(ws, fila, 1, metrica, bold=True, bg=bg, halign="left")
+        _cell(ws, fila, 2, col_score, bg=bg)
+        _cell(ws, fila, 3, peso, bold=True, bg=bg)
+        _cell(ws, fila, 4, desc, bg=bg, halign="left", wrap=True)
+        ws.row_dimensions[fila].height = 32
+        fila += 1
+
+    fila += 1
+
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(ws, fila, 1,
+          "UMBRALES DE SCORE POR MÉTRICA — Posgrado (Especialización y Maestría)",
+          bold=True, bg="37474F", fg=BLANCO, size=10)
+    ws.row_dimensions[fila].height = 20
+    fila += 1
+
+    METRICAS_HEADERS = [
+        "Score", "Peso",
+        f"Prom. primer\ncurso {_yr_fin}\n(S. Primer curso, 30%)",
+        "AAGR primer\ncurso robusto\n(S. AAGR, 20%) — ESP",
+        "AAGR primer\ncurso robusto\n(S. AAGR, 20%) — MAE",
+        "Salario\n(SMLMV)\n(S. Salario, 15%)",
+        f"% Inscritos\nno matr. {_yr_fin}\n(S. No matr., 10%)",
+        "N° programas\nen mercado\n(S. N° Prog., 5%)",
+        "Distancia vs\nbenchmark EAFIT\n(S. Costo, 5%)",
+    ]
+    for ci, h in enumerate(METRICAS_HEADERS, 1):
+        _cell(ws, fila, ci, h, bold=True, bg="455A64", fg=BLANCO, wrap=True, size=9)
+        ws.row_dimensions[fila].height = 44
+    fila += 1
+
+    UMBRALES = [
+        (1, "0-1.3", "≤ 3.0", "≤ 0.8%", "≤ -5.1%", "≤ 2 SMLMV", "> 50%", "> 32", "< -60%"),
+        (2, "1.3-2.3", "≤ 5.4", "≤ 5.8%", "≤ -0.6%", "≤ 3 SMLMV", "≤ 50%", "≤ 32", "< -40%"),
+        (3, "2.3-3.3", "≤ 8.5", "≤ 10.3%", "≤ 3.3%", "≤ 5 SMLMV", "≤ 30%", "≤ 18", "< -15%"),
+        (4, "3.3-4.3", "≤ 13.8", "≤ 18.0%", "≤ 8.0%", "≤ 8 SMLMV", "≤ 20%", "≤ 10", "< +20%"),
+        (5, "4.3-5.0", "> 13.8", "> 18.0%", "> 8.0%", "> 8 SMLMV", "≤ 10%", "≤ 4", "≥ +20%"),
+    ]
+    ETIQUETAS = {
+        1: "1 — Bajo", 2: "2 — Bajo-Medio", 3: "3 — Medio",
+        4: "4 — Medio-Alto", 5: "5 — Alto",
+    }
+
+    for score, peso_rango, mat, aagr_e, aagr_m, sal, nomat, nprog, costo in UMBRALES:
+        bg = SCORE_COLORES[score]
+        fg = SCORE_FUENTE[score]
+        _cell(ws, fila, 1, ETIQUETAS[score], bold=True, bg=bg, fg=fg)
+        _cell(ws, fila, 2, peso_rango, bg=bg, fg=fg)
+        for ci, val in enumerate([mat, aagr_e, aagr_m, sal, nomat, nprog, costo], 3):
+            _cell(ws, fila, ci, val, bg=bg, fg=fg)
+        ws.row_dimensions[fila].height = 20
+        fila += 1
+
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(ws, fila, 1,
+          "(*) El AAGR usa umbrales distintos para Especialización (ESP) y Maestría (MAE) "
+          "porque el mercado de maestrías tiene menor volatilidad (63% de categorías MAE "
+          "tienen AAGR < 3.3%). La participación usa quintiles dinámicos del segmento actual.",
+          bg="FFF8E1", fg="5D4037", halign="left", wrap=True, size=9)
+    ws.row_dimensions[fila].height = 28
+    fila += 1
+
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(ws, fila, 1, "TIPO DE MERCADO — Qué significa cada clasificación",
+          bold=True, bg="2E7D32", fg=BLANCO, size=10)
+    ws.row_dimensions[fila].height = 20
+    fila += 1
+
+    _yr_ini = AÑO_INICIO_HISTORICO
+    TIPOS_MERCADO = [
+        ("NORMAL",
+         f"El mercado tiene datos desde {_yr_ini} con base suficiente (≥ 30 estudiantes en ESP, "
+         f"≥ 15 en MAE). El AAGR se calcula como promedio de las 5 variaciones anuales."),
+        ("BASE_PEQUEÑA",
+         f"El mercado existe desde {_yr_ini} pero con pocos estudiantes (< 30 ESP / < 15 MAE). "
+         "El AAGR usa el CAGR (tasa compuesta) en lugar del promedio de variaciones, "
+         "para reducir el ruido estadístico de mercados pequeños."),
+        ("CATEGORIA_NUEVA",
+         f"El mercado no existía en {_yr_ini} (primer_curso_{_yr_ini} = 0) pero sí en años recientes. "
+         "El AAGR se calcula desde el primer año con dato disponible."),
+        ("EXTINTA",
+         f"El mercado existía en {_yr_ini} pero no tiene primer_curso en {_yr_fin}. "
+         "AAGR_ROBUSTO = -1.0 (penalización máxima). Score AAGR = 1."),
+        ("SIN_ACTIVIDAD",
+         "El mercado no tiene primer_curso en ningún año del período. "
+         "AAGR_ROBUSTO = NaN. Score AAGR = 1 (fallback conservador)."),
+    ]
+
+    for ci, h in enumerate(["Tipo de mercado", "Significado"], 1):
+        _cell(ws, fila, ci, h, bold=True, bg="388E3C", fg=BLANCO, size=9)
+    ws.row_dimensions[fila].height = 18
+    fila += 1
+
+    TIPO_BG = {
+        "NORMAL": "F1F8E9", "BASE_PEQUEÑA": "FFF8E1", "CATEGORIA_NUEVA": "E3F2FD",
+        "EXTINTA": "FFEBEE", "SIN_ACTIVIDAD": "F5F5F5",
+    }
+    for tipo, desc in TIPOS_MERCADO:
+        bg = TIPO_BG.get(tipo, "FFFFFF")
+        _cell(ws, fila, 1, tipo, bold=True, bg=bg, halign="left")
+        _cell(ws, fila, 2, desc, bg=bg, halign="left", wrap=True)
+        ws.row_dimensions[fila].height = 36
+        fila += 1
+
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(ws, fila, 1,
+          f"SEÑAL DE TENDENCIA — Momento actual del mercado "
+          f"(variación primer_curso {_yr_ant}→{_yr_fin})",
+          bold=True, bg="1565C0", fg=BLANCO, size=10)
+    ws.row_dimensions[fila].height = 20
+    fila += 1
+
+    SEÑALES = [
+        ("▲ ACELERANDO", "C8E6C9", "1B5E20",
+         f"Var. {_yr_ant}→{_yr_fin} > +10%. El mercado crece fuerte en el último año."),
+        ("→ ESTABLE", "FFF9C4", "827717",
+         f"Var. {_yr_ant}→{_yr_fin} entre −10% y +10%. Crecimiento moderado y consistente."),
+        ("▼ DESACELERANDO", "FFE0B2", "E65100",
+         f"Var. {_yr_ant}→{_yr_fin} negativa pero superior a −20%. Crecimiento que se frena."),
+        ("↓ EN DECLIVE", "FFCDD2", "B71C1C",
+         f"Var. {_yr_ant}→{_yr_fin} entre −20% y −50%. El mercado pierde estudiantes."),
+        ("↓↓ CONTRACCION", "EF9A9A", "B71C1C",
+         f"Var. {_yr_ant}→{_yr_fin} < −50%. Caída severa de la demanda."),
+        ("— SIN DATO", "EEEEEE", "757575",
+         f"No hay dato de primer_curso en {_yr_ant} o {_yr_fin} para calcular la variación."),
+    ]
+
+    for ci, h in enumerate(["Señal", "Descripción"], 1):
+        _cell(ws, fila, ci, h, bold=True, bg="1976D2", fg=BLANCO, size=9)
+    ws.row_dimensions[fila].height = 18
+    fila += 1
+
+    for señal, bg, fg, desc in SEÑALES:
+        _cell(ws, fila, 1, señal, bold=True, bg=bg, fg=fg)
+        _cell(ws, fila, 2, desc, bg=bg, fg=fg, halign="left", wrap=True)
+        ws.row_dimensions[fila].height = 28
+        fila += 1
+
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(ws, fila, 1,
+          "DIFERENCIA ENTRE AAGR SUMA Y AAGR PROM POR PROGRAMA",
+          bold=True, bg="5D4037", fg=BLANCO, size=10)
+    ws.row_dimensions[fila].height = 18
+    fila += 1
+
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(ws, fila, 1,
+          "AAGR suma del mercado: promedio de las variaciones interanuales de la SUMA total "
+          "de primer_curso. Responde a: ¿el mercado como un todo crece o decrece en nuevos "
+          "estudiantes? Es el insumo de AAGR_ROBUSTO (y del scoring S. AAGR). "
+          "||  "
+          "AAGR prom. por programa: promedio de las variaciones del PROMEDIO por registro SNIES. "
+          "Responde a: ¿cada programa individualmente captura más estudiantes? "
+          "Métrica informativa, no entra al scoring. "
+          "Si AAGR_suma sube pero AAGR_prom baja, el mercado crece porque hay más programas, "
+          "no porque los existentes mejoren.",
+          bg="EFEBE9", fg="3E2723", halign="left", wrap=True, size=10)
+    ws.row_dimensions[fila].height = 60
+
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 18
+    ws.column_dimensions["F"].width = 16
+    ws.column_dimensions["G"].width = 16
+    ws.column_dimensions["H"].width = 14
+    ws.column_dimensions["I"].width = 18
+    ws.sheet_view.showGridLines = False
+    ws.sheet_state = "visible"
 
 
 def _escribir_resumen_ejecutivo(
@@ -2480,13 +2850,13 @@ def _escribir_resumen_ejecutivo(
         ws["A2"].font = subtitle_font
 
         kpis = [
-            ("Total programas analizados", total_programas, "#,##0", False),
+            ("Total registros SNIES analizados", total_programas, "#,##0", False),
             ("Total categorías", total_categorias, "#,##0", False),
             (f"Matrícula total {AÑO_FIN_DATOS}", mat24, "#,##0", False),
             (f"Matrícula total {AÑO_INICIO_HISTORICO}", mat19, "#,##0", False),
             (f"Crecimiento global {AÑO_INICIO_HISTORICO}→{AÑO_FIN_DATOS}", crecimiento_global_pct, "0.0%", True),
-            ("Programas activos", es_activo_sum, "#,##0", False),
-            (f"Programas con matrícula {AÑO_FIN_DATOS}", tiene_matricula_2024_sum, "#,##0", False),
+            ("Registros con matrícula activa", es_activo_sum, "#,##0", False),
+            (f"Programas únicos con dato {AÑO_FIN_DATOS}", tiene_matricula_2024_sum, "#,##0", False),
             ("Categorías VERDES (calif. ≥ 4.0)", categorias_verdes, "#,##0", False),
             ("Categorías AMARILLO (3.0-3.9)", categorias_amarillo, "#,##0", False),
             ("Categorías ROJAS (calif. < 3.0)", categorias_rojas, "#,##0", False),
@@ -2555,7 +2925,10 @@ def _escribir_resumen_ejecutivo(
                 for j, dc in enumerate(data_cols):
                     v = row.get(dc, "")
                     number_fmt = None
-                    if dc in {f"suma_matricula_{AÑO_FIN_DATOS}"}:
+                    if dc in {
+                        f"suma_matricula_{AÑO_FIN_DATOS}",
+                        f"suma_primer_curso_{AÑO_FIN_DATOS}",
+                    }:
                         number_fmt = "#,##0"
                     elif dc in _PCT_COLS:
                         number_fmt = "0.0%"
@@ -2575,16 +2948,21 @@ def _escribir_resumen_ejecutivo(
                         border_on=False,
                     )
 
-        # Table A: Top 5 mayor matrícula (último año) (A-D)
+        # Table A: Top 5 mayor primer curso (último año) (A-D)
+        _col_pc_top = (
+            f"suma_primer_curso_{AÑO_FIN_DATOS}"
+            if f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag.columns
+            else f"suma_matricula_{AÑO_FIN_DATOS}"
+        )
         write_top_table(
             ag,
-            f"🎓 TOP 5 — MAYOR MATRÍCULA {AÑO_FIN_DATOS}",
+            f"🎓 TOP 5 — MAYOR PRIMER CURSO {AÑO_FIN_DATOS}",
             start_row,
             1,
-            ["Categoría", f"Matrícula {AÑO_FIN_DATOS}", "Calificación", "Crecimiento AAGR"],
-            ["CATEGORIA_FINAL", f"suma_matricula_{AÑO_FIN_DATOS}", "calificacion_final", "AAGR_ROBUSTO"],
+            ["Categoría", f"Primer curso {AÑO_FIN_DATOS}", "Calificación", "Crecimiento AAGR"],
+            ["CATEGORIA_FINAL", _col_pc_top, "calificacion_final", "AAGR_ROBUSTO"],
             5,
-            f"suma_matricula_{AÑO_FIN_DATOS}",
+            _col_pc_top,
             ascending=False,
         )
 
@@ -2724,8 +3102,8 @@ def run_analisis_regional(
     mismas métricas de la Fase 4 restringidas a ese departamento y añade las
     métricas nacionales como referencia para comparación directa.
 
-    Celdas con menos de UMBRAL_REGIONAL_MATRICULA matriculados en 2024 se
-    incluyen pero con DATOS_INSUFICIENTES=True y sin métricas de crecimiento.
+    Celdas con menos de UMBRAL_REGIONAL_PRIMER_CURSO nuevos matriculados (primer_curso)
+    en 2024 se incluyen pero con DATOS_INSUFICIENTES=True y sin métricas de crecimiento.
     Retorna None si la columna de departamento no existe en la sábana.
     """
     COL_DEPT = "DEPARTAMENTO_OFERTA_PROGRAMA"
@@ -2742,8 +3120,9 @@ def run_analisis_regional(
     registros: list[dict] = []
 
     for (cat, dept), grupo in sabana.groupby(["CATEGORIA_FINAL", COL_DEPT]):
-        mat_2024 = (
-            pd.to_numeric(grupo.get(f"matricula_{AÑO_FIN_DATOS}", pd.Series(dtype=float)), errors="coerce")
+        _col_pc_fin = f"primer_curso_{AÑO_FIN_DATOS}"
+        pc_2024_regional = (
+            pd.to_numeric(grupo.get(_col_pc_fin, pd.Series(dtype=float)), errors="coerce")
             .fillna(0)
             .sum()
         )
@@ -2753,68 +3132,81 @@ def run_analisis_regional(
             "DEPARTAMENTO": dept,
             "CATEGORIA_FINAL": cat,
             f"num_programas_regional_{AÑO_FIN_DATOS}": int(
-                (pd.to_numeric(grupo.get(f"matricula_{AÑO_FIN_DATOS}", pd.Series(dtype=float)), errors="coerce")
+                (pd.to_numeric(grupo.get(_col_pc_fin, pd.Series(dtype=float)), errors="coerce")
                  .fillna(0) > 0).sum()
             ),
-            f"suma_matricula_regional_{AÑO_FIN_DATOS}": mat_2024,
-            "DATOS_INSUFICIENTES": mat_2024 < UMBRAL_REGIONAL_MATRICULA,
+            f"suma_primer_curso_regional_{AÑO_FIN_DATOS}": pc_2024_regional,
+            "DATOS_INSUFICIENTES": pc_2024_regional < UMBRAL_REGIONAL_PRIMER_CURSO,
         }
 
-        if mat_2024 < UMBRAL_REGIONAL_MATRICULA:
+        if pc_2024_regional < UMBRAL_REGIONAL_PRIMER_CURSO:
             registros.append(fila)
             continue
 
-        # Matrículas anuales
-        sumas: dict[int, float] = {}
+        # Primer curso anual (fuente correcta para AAGR regional)
+        sumas_pc: dict[int, float] = {}
+        for y in years:
+            col_pc = f"primer_curso_{y}"
+            if col_pc in grupo.columns:
+                sumas_pc[y] = pd.to_numeric(grupo[col_pc], errors="coerce").fillna(0).sum()
+                fila[f"suma_primer_curso_regional_{y}"] = sumas_pc[y]
+            else:
+                sumas_pc[y] = 0.0
+
+        # Matrícula total solo como referencia (para umbral y contexto)
+        sumas_mat: dict[int, float] = {}
         for y in years:
             col_m = f"matricula_{y}"
             if col_m in grupo.columns:
-                sumas[y] = pd.to_numeric(grupo[col_m], errors="coerce").fillna(0).sum()
-                fila[f"suma_matricula_regional_{y}"] = sumas[y]
+                sumas_mat[y] = pd.to_numeric(grupo[col_m], errors="coerce").fillna(0).sum()
+                fila[f"suma_matricula_regional_{y}"] = sumas_mat[y]
 
-        # Variaciones y AAGR regional
-        vars_suma: list[float] = []
+        # Variaciones y AAGR regional — sobre primer_curso
+        vars_pc_reg: list[float] = []
         for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
-            if y in sumas and (y - 1) in sumas and sumas[y - 1] > 0:
-                v = (sumas[y] - sumas[y - 1]) / sumas[y - 1]
-                fila[f"var_suma_regional_{y}"] = v
-                vars_suma.append(v)
+            if y in sumas_pc and (y - 1) in sumas_pc and sumas_pc[y - 1] > 0:
+                v = (sumas_pc[y] - sumas_pc[y - 1]) / sumas_pc[y - 1]
+                fila[f"var_primer_curso_regional_{y}"] = v
+                vars_pc_reg.append(v)
             else:
-                fila[f"var_suma_regional_{y}"] = np.nan
+                fila[f"var_primer_curso_regional_{y}"] = np.nan
 
-        fila["AAGR_regional"] = float(np.mean(vars_suma)) if vars_suma else np.nan
+        fila["AAGR_regional"] = float(np.mean(vars_pc_reg)) if vars_pc_reg else np.nan
 
-        # CAGR regional (sobre el rango histórico completo)
-        m19 = sumas.get(AÑO_INICIO_HISTORICO, 0)
-        m24 = sumas.get(AÑO_FIN_DATOS, 0)
+        # CAGR regional — sobre primer_curso
+        pc19_reg = sumas_pc.get(AÑO_INICIO_HISTORICO, 0)
+        pc24_reg = sumas_pc.get(AÑO_FIN_DATOS, 0)
         _n_years_cagr = max(AÑO_FIN_DATOS - AÑO_INICIO_HISTORICO, 1)
         fila["CAGR_regional"] = (
-            float((m24 / m19) ** (1 / _n_years_cagr) - 1) if m19 > 0 and m24 > 0 else np.nan
+            float((pc24_reg / pc19_reg) ** (1 / _n_years_cagr) - 1)
+            if pc19_reg > 0 and pc24_reg > 0 else np.nan
         )
 
-        # Participación regional sobre el total nacional
+        # Participación regional sobre el total nacional de primer_curso
         total_nacional_2024 = (
-            ag_nacional[f"suma_matricula_{AÑO_FIN_DATOS}"].sum()
-            if f"suma_matricula_{AÑO_FIN_DATOS}" in ag_nacional.columns else 0
+            ag_nacional[f"suma_primer_curso_{AÑO_FIN_DATOS}"].sum()
+            if f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag_nacional.columns else 0
         )
         fila[f"participacion_regional_{AÑO_FIN_DATOS}"] = (
-            (m24 / total_nacional_2024) if total_nacional_2024 > 0 else np.nan
+            (pc24_reg / total_nacional_2024) if total_nacional_2024 > 0 else np.nan
         )
 
         # Referencia nacional para comparación directa
         fila_nac = ag_nacional[ag_nacional["CATEGORIA_FINAL"] == cat]
         if len(fila_nac) == 1:
             nac = fila_nac.iloc[0]
-            fila[f"suma_matricula_nacional_{AÑO_FIN_DATOS}"] = nac.get(f"suma_matricula_{AÑO_FIN_DATOS}", np.nan)
-            fila["AAGR_nacional"]                = nac.get("AAGR_suma", np.nan)
-            fila["calificacion_nacional"]         = nac.get("calificacion_final", np.nan)
-            mat_nac = nac.get(f"suma_matricula_{AÑO_FIN_DATOS}", 0) or 0
-            fila["pct_mercado_regional"] = (m24 / mat_nac) if mat_nac > 0 else np.nan
+            fila[f"suma_primer_curso_nacional_{AÑO_FIN_DATOS}"] = nac.get(
+                f"suma_primer_curso_{AÑO_FIN_DATOS}", np.nan
+            )
+            fila["AAGR_nacional"] = nac.get("AAGR_suma", np.nan)
+            fila["calificacion_nacional"] = nac.get("calificacion_final", np.nan)
+            pc_nac = nac.get(f"suma_primer_curso_{AÑO_FIN_DATOS}", 0) or 0
+            fila["pct_mercado_regional"] = (pc24_reg / pc_nac) if pc_nac > 0 else np.nan
         else:
-            fila[f"suma_matricula_nacional_{AÑO_FIN_DATOS}"] = np.nan
-            fila["AAGR_nacional"]                = np.nan
-            fila["calificacion_nacional"]         = np.nan
-            fila["pct_mercado_regional"]          = np.nan
+            fila[f"suma_primer_curso_nacional_{AÑO_FIN_DATOS}"] = np.nan
+            fila["AAGR_nacional"] = np.nan
+            fila["calificacion_nacional"] = np.nan
+            fila["pct_mercado_regional"] = np.nan
 
         # Salario y costo promedios del grupo regional
         if "SALARIO_OLE" in grupo.columns:
@@ -2843,7 +3235,7 @@ def run_analisis_regional(
     log_info(
         f"[Regional] {len(df_regional):,} celdas generadas "
         f"({df_regional['DATOS_INSUFICIENTES'].sum():,} con datos insuficientes, "
-        f"umbral={UMBRAL_REGIONAL_MATRICULA})."
+        f"umbral primer_curso={UMBRAL_REGIONAL_PRIMER_CURSO})."
     )
     return df_regional
 
@@ -2867,7 +3259,7 @@ def _exportar_estudio_segmento(
     NAC_COLS = {
         "calificacion_final": "calificacion_nacional",
         "AAGR_ROBUSTO": "AAGR_ROBUSTO_nacional",
-        f"suma_matricula_{AÑO_FIN_DATOS}": f"suma_matricula_nacional_{AÑO_FIN_DATOS}",
+        f"suma_primer_curso_{AÑO_FIN_DATOS}": f"suma_primer_curso_{AÑO_FIN_DATOS}",
     }
     keys = [k for k in NAC_COLS if k in ag_nacional.columns]
     if not keys:
@@ -2877,7 +3269,13 @@ def _exportar_estudio_segmento(
         )
     nac_cols_use = ["CATEGORIA_FINAL"] + keys
     nac_merge = ag_nacional[nac_cols_use].rename(columns={k: NAC_COLS[k] for k in keys})
-    ag_con_nac = ag_seg.merge(nac_merge, on="CATEGORIA_FINAL", how="left")
+
+    _col_pc_seg = f"suma_primer_curso_{AÑO_FIN_DATOS}"
+    _col_pc_reg = f"suma_primer_curso_regional_{AÑO_FIN_DATOS}"
+    ag_seg_ctx = ag_seg.copy()
+    if _col_pc_seg in ag_seg_ctx.columns:
+        ag_seg_ctx = ag_seg_ctx.rename(columns={_col_pc_seg: _col_pc_reg})
+    ag_con_nac = ag_seg_ctx.merge(nac_merge, on="CATEGORIA_FINAL", how="left")
 
     import shutil
     from datetime import date, datetime
@@ -2949,37 +3347,22 @@ def _exportar_estudio_segmento(
                     "calificacion_nacional",
                     "AAGR_ROBUSTO",
                     "AAGR_ROBUSTO_nacional",
-                    f"suma_matricula_{AÑO_FIN_DATOS}",
-                    f"suma_matricula_nacional_{AÑO_FIN_DATOS}",
+                    f"suma_primer_curso_regional_{AÑO_FIN_DATOS}",
+                    f"suma_primer_curso_{AÑO_FIN_DATOS}",
                     f"participacion_{AÑO_FIN_DATOS}",
                     f"num_programas_{AÑO_FIN_DATOS}",
                 ]
                 ctx_export = ag_con_nac[[c for c in ctx_cols if c in ag_con_nac.columns]].copy()
-                ctx_export = ctx_export.rename(
-                    columns={
-                        "calificacion_final": "Calif. segmento",
-                        "calificacion_nacional": "Calif. nacional",
-                        "AAGR_ROBUSTO": "AAGR segmento",
-                        "AAGR_ROBUSTO_nacional": "AAGR nacional",
-                        f"suma_matricula_{AÑO_FIN_DATOS}": f"Matrícula segmento {AÑO_FIN_DATOS}",
-                        f"suma_matricula_nacional_{AÑO_FIN_DATOS}": f"Matrícula nacional {AÑO_FIN_DATOS}",
-                        f"participacion_{AÑO_FIN_DATOS}": "Participación segmento",
-                        f"num_programas_{AÑO_FIN_DATOS}": "N° programas segmento",
-                    }
-                )
-                if "Calif. segmento" in ctx_export.columns:
-                    ctx_export = ctx_export.sort_values("Calif. segmento", ascending=False)
+                _ctx_rename = {
+                    k: v for k, v in HEADERS_CONTEXTO_NACIONAL.items() if k in ctx_export.columns
+                }
+                ctx_export = ctx_export.rename(columns=_ctx_rename)
+                _col_sort = HEADERS_CONTEXTO_NACIONAL.get("calificacion_final")
+                if _col_sort and _col_sort in ctx_export.columns:
+                    ctx_export = ctx_export.sort_values(_col_sort, ascending=False)
                 elif "CATEGORIA_FINAL" in ctx_export.columns:
                     ctx_export = ctx_export.sort_values("CATEGORIA_FINAL")
                 ctx_export.to_excel(writer, sheet_name="contexto_nacional", index=False)
-
-                try:
-                    df_eafit = run_fase6(ag_seg, log_info)
-                    if df_eafit is not None and len(df_eafit) > 0:
-                        df_eafit.to_excel(writer, sheet_name="eafit_vs_mercado", index=False)
-                        _formatear_hoja_eafit(writer, df_eafit)
-                except Exception as e:
-                    log_warning(f"[Segmento {etiqueta}] eafit_vs_mercado: {e}")
 
                 wb = writer.book
                 ws_det = wb["programas_detalle"]
@@ -3435,8 +3818,21 @@ def run_fase5(
                     _sem_verde, _sem_amarillo, _sem_rojo,
                     titulo="COLOMBIA",
                 )
+                _escribir_hoja_estandar(writer)
+                log_info("✓ Hoja 'estandar_calificacion' creada.")
                 sabana_final.to_excel(writer, sheet_name="programas_detalle", index=False)
                 col_order = _escribir_hoja_total(writer, total_final)
+                try:
+                    _wb_sheets = writer.book._sheets
+                    _ws_est = writer.book["estandar_calificacion"]
+                    _ws_res = writer.book["resumen_ejecutivo"]
+                    _idx_res = _wb_sheets.index(_ws_res)
+                    _wb_sheets.remove(_ws_est)
+                    _wb_sheets.insert(_idx_res + 1, _ws_est)
+                except Exception as _e_ord:
+                    log_warning(
+                        f"[Fase 5] No se pudo reordenar estandar_calificacion: {_e_ord}"
+                    )
                 wb = writer.book
                 ws_detalle = wb["programas_detalle"]
                 ws_detalle.freeze_panes = "A2"
@@ -3486,22 +3882,6 @@ def run_fase5(
                     _escribir_hoja_delta(writer, total_final)
                 except Exception as e:
                     log_warning(f"[Delta] Hoja de cambios omitida: {e}")
-
-                # ── Fase 6: EAFIT vs Mercado (opcional, no bloqueante) ──
-                try:
-                    df_eafit_vs_mercado = run_fase6(total_final, log_info)
-                    if df_eafit_vs_mercado is not None and len(df_eafit_vs_mercado) > 0:
-                        df_eafit_vs_mercado.to_excel(
-                            writer,
-                            sheet_name="eafit_vs_mercado",
-                            index=False,
-                        )
-                        _formatear_hoja_eafit(writer, df_eafit_vs_mercado)
-                        log_info("✓ Hoja 'eafit_vs_mercado' añadida al Excel.")
-                    else:
-                        log_warning("⚠ Fase 6 omitida — no se generó 'eafit_vs_mercado'.")
-                except Exception as e:
-                    log_warning(f"[Fase 6] No se pudo generar hoja eafit_vs_mercado: {e}")
 
                 # ── Gap de Oportunidad: Océanos Azules (opcional, no bloqueante) ──
                 try:
@@ -3609,451 +3989,250 @@ def run_fase5(
     log_etapa_completada("Fase 5: Exportación formateada", str(out_path))
 
 
-def _formatear_hoja_eafit(writer: pd.ExcelWriter, df: pd.DataFrame) -> None:
-    """Aplica formato visual a la hoja `eafit_vs_mercado`."""
-    try:
-        from openpyxl.styles import Alignment, Font, PatternFill
-
-        ws = writer.sheets.get("eafit_vs_mercado")
-        if ws is None:
-            return
-
-        # Encabezados
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", wrap_text=True)
-
-        # Índices por nombre de columna
-        headers = {cell.value: cell.column for cell in ws[1]}
-
-        # Colores semáforo
-        COLOR_MAP = {
-            "VERDE": "C6EFCE",
-            "AMARILLO": "FFEB9C",
-            "ROJO": "FFC7CE",
-            "SIN_DATOS": "D9D9D9",
-        }
-        sem_col = headers.get("SEMAFORO_CALIDAD")
-        oport_col = headers.get("OPORTUNIDAD")
-
-        if sem_col:
-            for row in ws.iter_rows(min_row=2, min_col=sem_col, max_col=sem_col):
-                for cell in row:
-                    color = COLOR_MAP.get(str(cell.value), "")
-                    if color:
-                        cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
-
-        # Colores oportunidad
-        OPORT_BG = {
-            "ALTA": "C6EFCE",
-            "MEDIA_ALTA": "E2EFDA",
-            "MEDIA": "FFEB9C",
-            "BAJA": "FFC7CE",
-            "INDETERMINADO": "D9D9D9",
-        }
-        OPORT_COLOR = {
-            "ALTA": "1F7A4A",
-            "MEDIA_ALTA": "000000",
-            "MEDIA": "000000",
-            "BAJA": "000000",
-            "INDETERMINADO": "000000",
-        }
-        if oport_col:
-            for row in ws.iter_rows(min_row=2, min_col=oport_col, max_col=oport_col):
-                for cell in row:
-                    bg = OPORT_BG.get(str(cell.value), "")
-                    fg = OPORT_COLOR.get(str(cell.value), "000000")
-                    if bg:
-                        cell.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-                        cell.font = Font(color=fg, bold=True)
-
-        # Congelar primera fila (encabezado)
-        ws.freeze_panes = "A2"
-
-    except Exception:
-        # No bloquear la export si falla el formateo.
-        return
-
-
 def run_gap_oportunidades(ag: pd.DataFrame, log) -> pd.DataFrame:
     """
-    Gap de Oportunidad (Océanos Azules) — análisis complementario a Fase 6.
+    Gap de Oportunidad — Océanos Azules.
 
-    Identifica categorías de mercado atractivas donde EAFIT no tiene
-    presencia actual. Son los 'espacios en blanco' del portafolio.
+    Identifica categorías de mercado atractivas donde EAFIT no tiene presencia.
+    Criterio de inclusión: calificacion_final >= 3.0 y categoría no cubierta
+    por MAPEO_PROGRAMAS_EAFIT.
 
-    Criterio de inclusión: categorías con calificacion_final >= 3.0
-    que NO están cubiertas por ningún programa del MAPEO_PROGRAMAS_EAFIT.
+    Columnas de salida (en orden de lectura para el analista):
+    IDENTIFICACIÓN → DECISIÓN → MERCADO → TENDENCIA → RETORNO → OFERTA → COSTO
 
-    Retorna DataFrame listo para escribir como hoja 'oportunidades_expansion'.
+    Thresholds calibrados sobre distribución real de las 129 categorías de
+    oportunidad Colombia 2024 (pipeline v4.5+).
     """
     log("━━━ Gap de Oportunidad — Océanos Azules ━━━")
 
-    if ag is None or len(ag) == 0:
-        log("⚠ Gap: DataFrame 'ag' vacío. Se omite hoja.")
+    if ag is None or len(ag) == 0 or "CATEGORIA_FINAL" not in ag.columns:
+        log("⚠ Gap: ag vacío o sin CATEGORIA_FINAL. Se omite hoja.")
         return pd.DataFrame()
 
-    if "CATEGORIA_FINAL" not in ag.columns:
-        log("⚠ Gap: columna CATEGORIA_FINAL no encontrada. Se omite hoja.")
-        return pd.DataFrame()
-
-    # Categorías ya cubiertas por EAFIT (valores únicos del mapeo)
-    cats_eafit = {str(v).strip().upper() for v in MAPEO_PROGRAMAS_EAFIT.values() if v}
-
-    # Normalizar nombres del agregado para comparación case-insensitive
-    ag_work = ag.copy()
-    ag_work["_cat_norm"] = ag_work["CATEGORIA_FINAL"].astype(str).str.strip().str.upper()
-
-    # Filtrar: sin presencia EAFIT + calificación mínima 3.0
     col_cal = "calificacion_final"
-    if col_cal not in ag_work.columns:
+    if col_cal not in ag.columns:
         log("⚠ Gap: columna calificacion_final no encontrada. Se omite hoja.")
         return pd.DataFrame()
 
+    cats_eafit = {str(v).strip().upper() for v in MAPEO_PROGRAMAS_EAFIT.values() if v}
+    ag_work = ag.copy()
+    ag_work["_cat_norm"] = ag_work["CATEGORIA_FINAL"].astype(str).str.strip().str.upper()
     ag_work[col_cal] = pd.to_numeric(ag_work[col_cal], errors="coerce")
+
     mask_sin_eafit = ~ag_work["_cat_norm"].isin(cats_eafit)
     mask_cal_min = ag_work[col_cal] >= 3.0
-
-    df_gap = ag_work[mask_sin_eafit & mask_cal_min].copy()
-    df_gap = df_gap.drop(columns=["_cat_norm"], errors="ignore")
+    df_gap = ag_work[mask_sin_eafit & mask_cal_min].drop(columns=["_cat_norm"],
+                                                          errors="ignore").copy()
 
     if len(df_gap) == 0:
         log("⚠ Gap: no se encontraron oportunidades con calificación ≥ 3.0.")
         return pd.DataFrame()
 
-    # Columnas a incluir en la hoja de salida
-    COLS_GAP = [
-        "CATEGORIA_FINAL",
-        "calificacion_final",
+    _num_cols = [
+        col_cal,
         "AAGR_ROBUSTO",
-        f"suma_matricula_{AÑO_FIN_DATOS}",
-        f"var_yoy_{AÑO_FIN_DATOS}",
-        "diferencial_tendencia",
+        f"suma_primer_curso_{AÑO_FIN_DATOS}",
         "SEÑAL_TENDENCIA",
-        "salario_promedio",
-        f"num_programas_{AÑO_FIN_DATOS}",
-        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}",
-        "costo_promedio",
-        "distancia_costo_pct",
-        "tasa_graduacion",
         "TIPO_CRECIMIENTO",
-    ]
-    cols_ok = [c for c in COLS_GAP if c in df_gap.columns]
-    df_gap = df_gap[cols_ok].copy()
-
-    # Columna de semáforo
-    df_gap["SEMAFORO"] = df_gap["calificacion_final"].apply(
-        lambda c: "VERDE" if c >= 4.0 else ("AMARILLO" if c >= 3.0 else "ROJO")
-    )
-
-    # Prioridad estratégica combinando calificación + señal de tendencia + matrícula
-    def _prioridad(row) -> str:
-        cal = row.get("calificacion_final", 0) or 0
-        senal = str(row.get("SEÑAL_TENDENCIA", "")).strip()
-        mat = row.get(f"suma_matricula_{AÑO_FIN_DATOS}", 0) or 0
-        if cal >= 4.0 and senal in ("ACELERANDO", "ESTABLE"):
-            return "1 - ALTA"
-        if cal >= 4.0 and senal == "DESACELERANDO":
-            return "2 - ALTA CON CAUTELA"
-        if cal >= 3.5 and senal in ("ACELERANDO", "ESTABLE"):
-            return "3 - MEDIA-ALTA"
-        if cal >= 4.0 and senal in ("EN_DECLIVE", "CONTRACCION"):
-            return "4 - REVISAR MOMENTUM"
-        if cal >= 3.5 and senal in ("DESACELERANDO", "EN_DECLIVE"):
-            return "5 - MEDIA CON CAUTELA"
-        return "6 - MONITOREAR"
-
-    df_gap["PRIORIDAD_ESTRATEGICA"] = df_gap.apply(_prioridad, axis=1)
-
-    # Ordenar: primero por prioridad, luego por calificación descendente
-    df_gap = df_gap.sort_values(
-        ["PRIORIDAD_ESTRATEGICA", "calificacion_final"],
-        ascending=[True, False]
-    ).reset_index(drop=True)
-
-    # Reordenar columnas: CATEGORIA_FINAL + SEMAFORO + PRIORIDAD primero
-    cols_primeras = ["CATEGORIA_FINAL", "SEMAFORO", "PRIORIDAD_ESTRATEGICA", "calificacion_final"]
-    cols_resto = [c for c in df_gap.columns if c not in cols_primeras]
-    df_gap = df_gap[cols_primeras + cols_resto]
-
-    # Log de resumen
-    verdes = int((df_gap["SEMAFORO"] == "VERDE").sum())
-    amarillos = int((df_gap["SEMAFORO"] == "AMARILLO").sum())
-    alta = int((df_gap["PRIORIDAD_ESTRATEGICA"] == "1 - ALTA").sum())
-    log(
-        f"✓ Gap completado: {len(df_gap)} oportunidades | "
-        f"🟢 Verde: {verdes} | 🟡 Amarillo: {amarillos} | "
-        f"⭐ Prioridad ALTA: {alta}"
-    )
-    return df_gap
-
-
-def run_fase6(ag: pd.DataFrame, log) -> pd.DataFrame:
-    """
-    Fase 6 — Análisis EAFIT vs Mercado (opcional, no bloqueante).
-
-    Devuelve un DataFrame listo para escribir como hoja `eafit_vs_mercado`
-    o DataFrame vacío si falta el archivo de referencia.
-    """
-    from etl.config import PROGRAMAS_EAFIT
-
-    log("━━━ Fase 6 — EAFIT vs Mercado ━━━")
-
-    if not PROGRAMAS_EAFIT.exists():
-        log(
-            f"⚠ Archivo no encontrado: {PROGRAMAS_EAFIT}\n"
-            f"  Coloca 'programas_para_valorizacion.xlsx' en ref/backup/ "
-            f"y vuelve a ejecutar el pipeline para generar el análisis EAFIT."
-        )
-        return pd.DataFrame()
-
-    try:
-        # Misma convención que valorizacion_pipeline / _leer_programas_eafit:
-        # fila 0 = bloques; fila 1 = encabezados reales.
-        df_raw = (
-            pd.read_excel(PROGRAMAS_EAFIT, header=1)
-            if str(PROGRAMAS_EAFIT).lower().endswith((".xlsx", ".xlsm"))
-            else pd.read_excel(PROGRAMAS_EAFIT)
-        )
-    except Exception as exc:
-        log(f"✗ Error leyendo {PROGRAMAS_EAFIT.name}: {exc}")
-        return pd.DataFrame()
-
-    if df_raw is None or len(df_raw) == 0:
-        log("⚠ Fase 6: el archivo EAFIT viene vacío. Se omite hoja.")
-        return pd.DataFrame()
-
-    # Normalizar columnas — misma lógica específica que _leer_programas_eafit()
-    # para evitar capturar columnas de scoring que también contienen "programa".
-    rename_map: dict[str, str] = {}
-    for col in df_raw.columns:
-        col_lower = str(col).strip().lower()
-        if "proceso" in col_lower or "calidad" in col_lower:
-            rename_map[col] = "PROGRAMA_EAFIT"
-        elif "estudio" in col_lower and "mercado" in col_lower:
-            rename_map[col] = "TIENE_ESTUDIO_MERCADO"
-    df_raw = df_raw.rename(columns=rename_map)
-
-    # Guardia contra columnas duplicadas: si aún existen dos columnas con el mismo
-    # nombre (improbable, pero defensivo), conservar solo la primera.
-    df_raw = df_raw.loc[:, ~df_raw.columns.duplicated(keep="first")]
-
-    if "PROGRAMA_EAFIT" not in df_raw.columns:
-        log("✗ No se encontró la columna de nombres de programa en el archivo.")
-        return pd.DataFrame()
-
-    # Deduplicar (un programa puede repetirse por grupos/sedes)
-    keep_cols = ["PROGRAMA_EAFIT"]
-    if "TIENE_ESTUDIO_MERCADO" in df_raw.columns:
-        keep_cols.append("TIENE_ESTUDIO_MERCADO")
-    df_eafit = (
-        df_raw[keep_cols]
-        .dropna(subset=["PROGRAMA_EAFIT"])
-        .drop_duplicates(subset=["PROGRAMA_EAFIT"])
-        .reset_index(drop=True)
-    )
-
-    # Asegurar columna TIENE_ESTUDIO_MERCADO si no existía
-    if "TIENE_ESTUDIO_MERCADO" not in df_eafit.columns:
-        df_eafit["TIENE_ESTUDIO_MERCADO"] = False
-
-    # Asignar categoría de mercado por mapeo (tolerante a mayúsculas/minúsculas)
-    # El input puede venir mezclado: pregrados en minúsculas (catálogo) y posgrados en Title Case.
-    _mapeo_normalizado = {str(k).strip().lower(): v for k, v in MAPEO_PROGRAMAS_EAFIT.items()}
-    df_eafit["CATEGORIA_MERCADO"] = (
-        df_eafit["PROGRAMA_EAFIT"].astype(str).str.strip().str.lower().map(_mapeo_normalizado)
-    )
-
-    sin_mapeo = df_eafit[df_eafit["CATEGORIA_MERCADO"].isna()]
-    if not sin_mapeo.empty:
-        muestras = sin_mapeo["PROGRAMA_EAFIT"].astype(str).tolist()[:30]
-        log(
-            f"⚠ {len(sin_mapeo)} programa(s) sin categoría asignada "
-            f"(agregar en MAPEO_PROGRAMAS_EAFIT si son nuevos). Primeros 30:\n"
-            + "\n".join(f"    - {p}" for p in muestras)
-        )
-
-    # Extraer nivel de formación desde el catálogo EAFIT (fuente de verdad)
-    # La heurística por prefijo fallaba con pregrados de nombre genérico
-    # (ej. "Ingeniería de Sistemas" no empieza por "pregrado").
-    try:
-        _df_cat = (
-            pd.read_excel(ARCHIVO_CATALOGO_EAFIT)
-            if str(ARCHIVO_CATALOGO_EAFIT).endswith(".xlsx")
-            else pd.read_csv(ARCHIVO_CATALOGO_EAFIT, encoding="utf-8-sig")
-        )
-        # Normalizar nombre para cruce
-        _df_cat["_nombre_cat_norm"] = _df_cat["Nombre Programa EAFIT"].str.lower().str.strip()
-        _cat_nivel = _df_cat.set_index("_nombre_cat_norm")["NIVEL_DE_FORMACIÓN"].to_dict()
-    except Exception:
-        _cat_nivel = {}
-
-    def _nivel(nombre: str) -> str:
-        n_norm = str(nombre).strip().lower()
-        nivel_cat = _cat_nivel.get(n_norm, "")
-        if nivel_cat:
-            n_lv = str(nivel_cat).strip().lower()
-            if "maestr" in n_lv or "magist" in n_lv:
-                return "Maestría"
-            if "universit" in n_lv or "pregrad" in n_lv:
-                return "Pregrado"
-            if "especial" in n_lv:
-                return "Especialización"
-        # Fallback heurístico si el programa no está en el catálogo
-        n_lower = n_norm
-        if n_lower.startswith(("maestría", "maestria", "master", "msc")):
-            return "Maestría"
-        if n_lower.startswith(("pregrado", "licenciatura")):
-            return "Pregrado"
-        return "Especialización"
-
-    df_eafit["NIVEL_FORMACION"] = df_eafit["PROGRAMA_EAFIT"].apply(_nivel)
-
-    # eafit_vs_mercado solo incluye programas de posgrado (ESP y MAE).
-    # Los programas UNIVERSITARIO de EAFIT tienen su propio análisis en total_pregrado
-    # (calibrado al universo pregrado, donde sus métricas son comparables).
-    _n_pre_eafit = (df_eafit["NIVEL_FORMACION"] == "Pregrado").sum()
-    df_eafit = df_eafit[df_eafit["NIVEL_FORMACION"] != "Pregrado"].reset_index(drop=True)
-    if _n_pre_eafit > 0:
-        log(
-            f"[Fase 6] Excluidos {_n_pre_eafit} programa(s) EAFIT de pregrado de "
-            "eafit_vs_mercado. Solo se incluyen Especialización y Maestría."
-        )
-
-    if ag is None or len(ag) == 0:
-        log("⚠ Fase 6: DataFrame 'ag' (hoja total) vacío. Se omite hoja.")
-        return pd.DataFrame()
-
-    # Columnas que queremos traer de ag (hoja total)
-    COLS_MERCADO = [
-        "CATEGORIA_FINAL",
-        "calificacion_final",
-        f"suma_matricula_{AÑO_FIN_DATOS}",
-        "AAGR_ROBUSTO",
-        "AAGR_suma",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}",
         "salario_promedio",
         f"num_programas_{AÑO_FIN_DATOS}",
         "programas_nuevos_3a",
-        f"pct_no_matriculados_{AÑO_FIN_DATOS}",
         "costo_promedio",
-        "score_matricula",
-        "score_AAGR",
-        "score_salario",
-        "AAGR_primer_curso",
+        "distancia_costo_pct",
+        "NIVEL_MAYORIT",
+        f"var_yoy_{AÑO_FIN_DATOS}",
+        "CAGR_suma",
         "tasa_graduacion",
     ]
-    cols_ok = [c for c in COLS_MERCADO if c in ag.columns]
-    if "CATEGORIA_FINAL" in cols_ok:
-        df_merc = ag[cols_ok].copy().rename(columns={"CATEGORIA_FINAL": "CATEGORIA_MERCADO"})
-    else:
-        # Si por alguna razón la hoja 'total' no tiene el nombre de columna esperado, no se puede continuar.
-        log("✗ La hoja 'total' no contiene 'CATEGORIA_FINAL'. Se omite hoja eafit_vs_mercado.")
-        return pd.DataFrame()
+    for c in _num_cols:
+        if c in df_gap.columns and c not in ("SEÑAL_TENDENCIA", "TIPO_CRECIMIENTO",
+                                              "NIVEL_MAYORIT"):
+            df_gap[c] = pd.to_numeric(df_gap[c], errors="coerce")
 
-    df_result = df_eafit.merge(df_merc, on="CATEGORIA_MERCADO", how="left")
-
-    # Tipos numéricos para cálculos seguros
-    for c in ["calificacion_final", "AAGR_suma", "AAGR_ROBUSTO"]:
-        if c in df_result.columns:
-            df_result[c] = pd.to_numeric(df_result[c], errors="coerce")
-    if f"suma_matricula_{AÑO_FIN_DATOS}" in df_result.columns:
-        df_result[f"suma_matricula_{AÑO_FIN_DATOS}"] = pd.to_numeric(df_result[f"suma_matricula_{AÑO_FIN_DATOS}"], errors="coerce")
-    if "salario_promedio" in df_result.columns:
-        df_result["salario_promedio"] = pd.to_numeric(df_result["salario_promedio"], errors="coerce")
-    if "costo_promedio" in df_result.columns:
-        df_result["costo_promedio"] = pd.to_numeric(df_result["costo_promedio"], errors="coerce")
-    if "AAGR_primer_curso" in df_result.columns:
-        df_result["AAGR_primer_curso"] = pd.to_numeric(df_result["AAGR_primer_curso"], errors="coerce")
-
-    # Columnas derivadas
-    def _semaforo(c) -> str:
-        if pd.isna(c):
-            return "SIN_DATOS"
-        if c >= 4.0:
-            return "VERDE"
-        if c >= 3.0:
-            return "AMARILLO"
-        return "ROJO"
-
-    df_result["SEMAFORO_CALIDAD"] = df_result.get("calificacion_final", pd.Series(index=df_result.index)).apply(_semaforo)
-
-    _aagr_col = "AAGR_ROBUSTO" if "AAGR_ROBUSTO" in df_result.columns else "AAGR_suma"
-    if _aagr_col in df_result.columns:
-        df_result["AAGR_PCT"] = (df_result[_aagr_col] * 100).round(2)
-    else:
-        df_result["AAGR_PCT"] = np.nan
-
-    # Fallback: si AAGR_PCT es NaN pero existe AAGR_primer_curso en el segmento, usarlo.
-    if "AAGR_primer_curso" in df_result.columns:
-        mask_aagr_nan = df_result["AAGR_PCT"].isna()
-        mask_pc_ok = df_result["AAGR_primer_curso"].notna()
-        mask_cal_ok = df_result["calificacion_final"].notna()
-        mask_fallback = mask_aagr_nan & mask_pc_ok & mask_cal_ok
-        if mask_fallback.any():
-            df_result.loc[mask_fallback, "AAGR_PCT"] = (
-                df_result.loc[mask_fallback, "AAGR_primer_curso"] * 100
-            ).round(2)
-            log(
-                f"AAGR_PCT: {int(mask_fallback.sum())} filas con fallback a AAGR_primer_curso "
-                f"(AAGR_ROBUSTO no disponible en segmento)"
-            )
-
-    def _oportunidad(row) -> str:
-        c = row.get("calificacion_final")
-        a = row.get("AAGR_PCT")
-        if pd.isna(c):
-            return "INDETERMINADO"
-        if pd.isna(a):
-            if c >= 4.0:
-                return "MEDIA_ALTA"
-            if c >= 3.0:
-                return "MEDIA"
-            return "BAJA"
-        if c >= 4.0 and a > 15:
-            return "ALTA"
-        if c >= 3.5 or a > 20:
-            return "MEDIA_ALTA"
-        if c >= 3.0 and a > 0:
-            return "MEDIA"
-        if a < 0:
-            return "BAJA"
-        return "MEDIA"
-
-    df_result["OPORTUNIDAD"] = df_result.apply(_oportunidad, axis=1)
-
-    # Orden de salida
-    COLS_SALIDA = [
-        "PROGRAMA_EAFIT",
-        "NIVEL_FORMACION",
-        "TIENE_ESTUDIO_MERCADO",
-        "CATEGORIA_MERCADO",
-        "SEMAFORO_CALIDAD",
-        "OPORTUNIDAD",
-        "calificacion_final",
-        "AAGR_PCT",
-        f"suma_matricula_{AÑO_FIN_DATOS}",
-        "salario_promedio",
-        f"num_programas_{AÑO_FIN_DATOS}",
-        "costo_promedio",
-        "AAGR_primer_curso",
-        "tasa_graduacion",
-    ]
-    cols_final = [c for c in COLS_SALIDA if c in df_result.columns]
-    df_result = df_result[cols_final].copy()
-
-    # Log de resumen
-    v = int((df_result["SEMAFORO_CALIDAD"] == "VERDE").sum()) if "SEMAFORO_CALIDAD" in df_result.columns else 0
-    a = int((df_result["SEMAFORO_CALIDAD"] == "AMARILLO").sum()) if "SEMAFORO_CALIDAD" in df_result.columns else 0
-    r = int((df_result["SEMAFORO_CALIDAD"] == "ROJO").sum()) if "SEMAFORO_CALIDAD" in df_result.columns else 0
-    log(
-        f"✓ Fase 6 completada: {len(df_result)} programas analizados  | "
-        f"🟢 Verde: {v}  🟡 Amarillo: {a}  🔴 Rojo: {r}"
+    df_gap["SEMAFORO"] = df_gap[col_cal].apply(
+        lambda c: "VERDE" if c >= 4.0 else ("AMARILLO" if c >= 3.0 else "ROJO")
     )
-    return df_result
+
+    def _pts_cal(c):
+        if pd.isna(c):
+            return 0.0
+        return max(0.0, min(40.0, (float(c) - 3.0) / 2.0 * 40.0))
+
+    def _pts_aagr(a):
+        if pd.isna(a):
+            return 0.0
+        a = float(a)
+        if a < 0:
+            return 0.0
+        if a < 0.05:
+            return round(a / 0.05 * 6, 2)
+        if a < 0.15:
+            return round(6 + (a - 0.05) / 0.10 * 10, 2)
+        if a < 0.25:
+            return round(16 + (a - 0.15) / 0.10 * 6, 2)
+        return 25.0
+
+    def _pts_pc(v):
+        if pd.isna(v):
+            return 0.0
+        v = float(v)
+        if v < 68:
+            return round(v / 68 * 4, 2)
+        if v < 151:
+            return round(4 + (v - 68) / 83 * 4, 2)
+        if v < 420:
+            return round(8 + (v - 151) / 269 * 4, 2)
+        if v < 1150:
+            return round(12 + (v - 420) / 730 * 4, 2)
+        if v < 2000:
+            return round(16 + (v - 1150) / 850 * 4, 2)
+        return 20.0
+
+    def _pts_sal(s):
+        if pd.isna(s):
+            return 0.0
+        s = float(s)
+        if s < 3:
+            return 0.0
+        if s < 5.1:
+            return round((s - 3) / 2.1 * 5, 2)
+        if s < 6.0:
+            return round(5 + (s - 5.1) / 0.9 * 4, 2)
+        if s < 7.2:
+            return round(9 + (s - 6.0) / 1.2 * 3, 2)
+        if s < 9.0:
+            return round(12 + (s - 7.2) / 1.8 * 3, 2)
+        return 15.0
+
+    df_gap["_pts_cal"] = df_gap[col_cal].apply(_pts_cal)
+    df_gap["_pts_aagr"] = df_gap["AAGR_ROBUSTO"].apply(_pts_aagr)
+    df_gap["_pts_pc"] = df_gap[f"suma_primer_curso_{AÑO_FIN_DATOS}"].apply(_pts_pc)
+    df_gap["_pts_sal"] = df_gap["salario_promedio"].apply(_pts_sal)
+
+    df_gap["PUNTUACION_OPORTUNIDAD"] = (
+        df_gap["_pts_cal"] + df_gap["_pts_aagr"] +
+        df_gap["_pts_pc"] + df_gap["_pts_sal"]
+    ).round(1)
+    df_gap.drop(columns=["_pts_cal", "_pts_aagr", "_pts_pc", "_pts_sal"],
+                inplace=True, errors="ignore")
+
+    def _senal_favorable(s: str) -> bool:
+        s = str(s).strip().upper()
+        return s in ("ACELERANDO", "ESTABLE") or s.startswith("▲") or s.startswith("→")
+
+    def _nivel_oportunidad(row) -> str:
+        pts = row.get("PUNTUACION_OPORTUNIDAD", 0) or 0
+        senal = str(row.get("SEÑAL_TENDENCIA", "")).strip()
+        pc = row.get(f"suma_primer_curso_{AÑO_FIN_DATOS}", 0) or 0
+
+        if pc < 68:
+            return "🟡 Baja-Media"
+
+        if pts >= 75:
+            if _senal_favorable(senal):
+                return "🟢 Alta"
+            return "🟡 Alta con Cautela"
+        if pts >= 55:
+            if _senal_favorable(senal):
+                return "🟢 Media-Alta"
+            return "🟡 Media"
+        if pts >= 35:
+            return "🟡 Media"
+        return "🔴 Baja"
+
+    df_gap["NIVEL_OPORTUNIDAD"] = df_gap.apply(_nivel_oportunidad, axis=1)
+
+    _SENAL_EMOJI = {
+        "ACELERANDO": "▲ ACELERANDO",
+        "ESTABLE": "→ ESTABLE",
+        "DESACELERANDO": "▼ DESACELERANDO",
+        "EN_DECLIVE": "↓ EN DECLIVE",
+        "CONTRACCION": "↓↓ CONTRACCION",
+        "SIN_DATO": "— SIN DATO",
+    }
+    if "SEÑAL_TENDENCIA" in df_gap.columns:
+        df_gap["SEÑAL_TENDENCIA"] = df_gap["SEÑAL_TENDENCIA"].apply(
+            lambda v: _SENAL_EMOJI.get(str(v).strip(), str(v).strip())
+            if pd.notna(v) else "— SIN DATO"
+        )
+
+    COLS_SALIDA_ORDEN = [
+        "CATEGORIA_FINAL",
+        "NIVEL_MAYORIT",
+        "SEMAFORO",
+        "NIVEL_OPORTUNIDAD",
+        "PUNTUACION_OPORTUNIDAD",
+        col_cal,
+        f"suma_primer_curso_{AÑO_FIN_DATOS}",
+        "AAGR_ROBUSTO",
+        "CAGR_suma",
+        "SEÑAL_TENDENCIA",
+        "TIPO_CRECIMIENTO",
+        f"var_yoy_{AÑO_FIN_DATOS}",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}",
+        "salario_promedio",
+        "tasa_graduacion",
+        f"num_programas_{AÑO_FIN_DATOS}",
+        "programas_nuevos_3a",
+        "costo_promedio",
+        "distancia_costo_pct",
+    ]
+
+    RENAME_COLS = {
+        "CATEGORIA_FINAL": "Categoría de mercado",
+        "NIVEL_MAYORIT": "Nivel predominante",
+        "SEMAFORO": "Semáforo",
+        "NIVEL_OPORTUNIDAD": "Nivel de oportunidad",
+        "PUNTUACION_OPORTUNIDAD": "Puntuación (0-100)",
+        col_cal: "Calificación (1-5)",
+        f"suma_primer_curso_{AÑO_FIN_DATOS}": f"Primer curso {AÑO_FIN_DATOS}",
+        "AAGR_ROBUSTO": "AAGR (% anual)",
+        "CAGR_suma": "CAGR 2019-2024 (%)",
+        "SEÑAL_TENDENCIA": "Señal de tendencia",
+        "TIPO_CRECIMIENTO": "Tipo de mercado",
+        f"var_yoy_{AÑO_FIN_DATOS}": "Var. último año (%)",
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}": "% Inscritos no matriculados",
+        "salario_promedio": "Salario prom. (SMLMV)",
+        "tasa_graduacion": "Tasa de graduación",
+        f"num_programas_{AÑO_FIN_DATOS}": "N° programas en mercado",
+        "programas_nuevos_3a": "Prog. nuevos (3 años)",
+        "costo_promedio": "Costo prom. mercado ($)",
+        "distancia_costo_pct": "Distancia vs EAFIT (%)",
+    }
+
+    cols_ok = [c for c in COLS_SALIDA_ORDEN if c in df_gap.columns]
+    df_gap = df_gap[cols_ok].rename(columns=RENAME_COLS)
+
+    sort_cols = []
+    if "Puntuación (0-100)" in df_gap.columns:
+        sort_cols.append(("Puntuación (0-100)", False))
+    if "Calificación (1-5)" in df_gap.columns:
+        sort_cols.append(("Calificación (1-5)", False))
+    if sort_cols:
+        df_gap = df_gap.sort_values(
+            [c for c, _ in sort_cols],
+            ascending=[a for _, a in sort_cols],
+        ).reset_index(drop=True)
+
+    alta = (df_gap["Nivel de oportunidad"].str.contains("Alta", na=False)).sum() \
+        if "Nivel de oportunidad" in df_gap.columns else 0
+    med_alt = (df_gap["Nivel de oportunidad"].str.contains("Media-Alta", na=False)).sum() \
+        if "Nivel de oportunidad" in df_gap.columns else 0
+    if "Puntuación (0-100)" in df_gap.columns:
+        log(
+            f"✓ Gap completado: {len(df_gap)} oportunidades | "
+            f"🟢 Alta: {alta} | 🟢 Media-Alta: {med_alt} | "
+            f"Puntuación máxima: {df_gap['Puntuación (0-100)'].max():.0f} | "
+            f"mínima: {df_gap['Puntuación (0-100)'].min():.0f}"
+        )
+    else:
+        log(f"✓ Gap completado: {len(df_gap)} oportunidades")
+    return df_gap
 
 
 def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
-    """Aplica formato visual a la hoja oportunidades_expansion."""
+    """Formato visual de la hoja oportunidades_expansion."""
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
 
@@ -4061,25 +4240,19 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
     if ws is None:
         return
 
-    AZUL = "000066"
+    AZUL_OSC = "000066"
     BLANCO = "FFFFFF"
-    GRIS_ALT = "F5F5F5"
+    GRIS_ALT = "F7F7F7"
 
-    # Colores de semáforo para filas
-    FILA_FILLS = {
-        "VERDE": "EBF9EE",
-        "AMARILLO": "FFFDE7",
-        "ROJO": "FFF0F0",
-    }
+    FILA_FILLS = {"VERDE": "EBF9EE", "AMARILLO": "FFFDE7", "ROJO": "FFF0F0"}
 
-    # Colores de prioridad para la celda PRIORIDAD_ESTRATEGICA
-    PRIOR_FILLS = {
-        "1 - ALTA": ("1F7A3C", "FFFFFF"),  # verde oscuro, texto blanco
-        "2 - ALTA CON CAUTELA": ("FFD966", "7D4800"),  # ámbar, texto café
-        "3 - MEDIA-ALTA": ("C6EFCE", "1A5C2A"),  # verde suave, texto verde
-        "4 - REVISAR MOMENTUM": ("FF7043", "FFFFFF"),  # naranja, texto blanco
-        "5 - MEDIA CON CAUTELA": ("FFD9B3", "7D3800"),  # naranja suave, texto café
-        "6 - MONITOREAR": ("EEEEEE", "555555"),  # gris, texto gris
+    NIVEL_FILLS = {
+        "🟢 Alta": ("1F7A3C", "FFFFFF"),
+        "🟢 Media-Alta": ("C6EFCE", "1A5C2A"),
+        "🟡 Alta con Cautela": ("FFD966", "7D4800"),
+        "🟡 Media": ("FFFDE7", "7D4800"),
+        "🟡 Baja-Media": ("FFF0CC", "7D4800"),
+        "🔴 Baja": ("FFC7CE", "9C0006"),
     }
 
     SENAL_FILLS = {
@@ -4096,53 +4269,111 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
 
     cols = [cell.value for cell in ws[1]]
 
-    # Fila 1: encabezados
-    for ci, header in enumerate(cols, start=1):
-        cell = ws.cell(row=1, column=ci)
-        cell.value = header
-        cell.font = Font(bold=True, color=BLANCO, name="Arial", size=10)
-        cell.fill = PatternFill("solid", fgColor=AZUL)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = borde
+    _col_pc_hdr = f"Primer curso {AÑO_FIN_DATOS}"
+    BLOQUES = {
+        "Categoría de mercado": ("IDENTIFICACIÓN", "37474F"),
+        "Nivel predominante": ("IDENTIFICACIÓN", "37474F"),
+        "Semáforo": ("DECISIÓN", AZUL_OSC),
+        "Nivel de oportunidad": ("DECISIÓN", AZUL_OSC),
+        "Puntuación (0-100)": ("DECISIÓN", AZUL_OSC),
+        "Calificación (1-5)": ("DECISIÓN", AZUL_OSC),
+        _col_pc_hdr: ("MERCADO", "2E7D32"),
+        "AAGR (% anual)": ("MERCADO", "2E7D32"),
+        "CAGR 2019-2024 (%)": ("MERCADO", "2E7D32"),
+        "Señal de tendencia": ("MERCADO", "2E7D32"),
+        "Tipo de mercado": ("MERCADO", "2E7D32"),
+        "Var. último año (%)": ("MERCADO", "2E7D32"),
+        "% Inscritos no matriculados": ("DEMANDA", "E65100"),
+        "Salario prom. (SMLMV)": ("RETORNO", "5D4037"),
+        "Tasa de graduación": ("RETORNO", "5D4037"),
+        "N° programas en mercado": ("OFERTA", "2E4057"),
+        "Prog. nuevos (3 años)": ("OFERTA", "2E4057"),
+        "Costo prom. mercado ($)": ("COSTO", "6A1B9A"),
+        "Distancia vs EAFIT (%)": ("COSTO", "6A1B9A"),
+    }
 
-    ws.row_dimensions[1].height = 36
+    ws.insert_rows(1)
+    current_blk = None
+    blk_start = 1
+    prev_color = "455A64"
+    for ci, col_name in enumerate(cols, start=1):
+        blk_info = BLOQUES.get(str(col_name), ("OTRO", "455A64"))
+        blk_name, blk_color = blk_info
+        if blk_name != current_blk:
+            if current_blk is not None:
+                ws.merge_cells(start_row=1, start_column=blk_start,
+                               end_row=1, end_column=ci - 1)
+                cell = ws.cell(row=1, column=blk_start)
+                cell.value = current_blk
+                cell.fill = PatternFill("solid", fgColor=prev_color)
+                cell.font = Font(bold=True, color=BLANCO, name="Arial", size=9)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            current_blk = blk_name
+            prev_color = blk_color
+            blk_start = ci
+        cell2 = ws.cell(row=2, column=ci)
+        cell2.fill = PatternFill("solid", fgColor=blk_color)
+        cell2.font = Font(bold=True, color=BLANCO, name="Arial", size=9)
+        cell2.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell2.border = borde
 
-    # Datos
-    for ri in range(2, ws.max_row + 1):
-        # Color base de fila según semáforo
-        sem_val = ""
-        if "SEMAFORO" in cols:
-            sem_val = str(ws.cell(row=ri, column=cols.index("SEMAFORO") + 1).value or "")
-        base_fill = PatternFill("solid", fgColor=FILA_FILLS.get(sem_val, GRIS_ALT))
+    if current_blk:
+        ws.merge_cells(start_row=1, start_column=blk_start,
+                       end_row=1, end_column=len(cols))
+        cell = ws.cell(row=1, column=blk_start)
+        cell.value = current_blk
+        cell.fill = PatternFill("solid", fgColor=prev_color)
+        cell.font = Font(bold=True, color=BLANCO, name="Arial", size=9)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.row_dimensions[1].height = 18
+    ws.row_dimensions[2].height = 32
+
+    sem_col_idx = cols.index("Semáforo") + 1 if "Semáforo" in cols else None
+    niv_col_idx = cols.index("Nivel de oportunidad") + 1 if "Nivel de oportunidad" in cols else None
+
+    for ri in range(3, ws.max_row + 1):
+        zebra = ri % 2 == 0
+        sem_raw = str(ws.cell(row=ri, column=sem_col_idx).value or "") if sem_col_idx else ""
+        sem_key = sem_raw.split()[-1] if sem_raw else ""
+        base_fill = PatternFill(
+            "solid",
+            fgColor=FILA_FILLS.get(sem_key, GRIS_ALT) if not zebra else "FAFAFA",
+        )
 
         for ci, col_name in enumerate(cols, start=1):
             cell = ws.cell(row=ri, column=ci)
+            col_s = str(col_name)
             cell.border = borde
             cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.fill = base_fill
 
-            # Color y formato por columna
-            if col_name == "SEMAFORO":
-                sem = str(cell.value or "")
+            if col_s == "Semáforo":
+                sem_raw_v = str(cell.value or "")
+                sk = sem_raw_v.split()[-1] if sem_raw_v else ""
                 color_map = {"VERDE": "1F7A3C", "AMARILLO": "B8860B", "ROJO": "C62828"}
                 emoji_map = {"VERDE": "🟢 VERDE", "AMARILLO": "🟡 AMARILLO", "ROJO": "🔴 ROJO"}
-                cell.value = emoji_map.get(sem, sem)
-                cell.fill = base_fill
-                cell.font = Font(bold=True, color=color_map.get(sem, "000000"), name="Arial", size=10)
+                cell.value = emoji_map.get(sk, sem_raw_v)
+                cell.font = Font(bold=True, color=color_map.get(sk, "000000"),
+                                 name="Arial", size=10)
 
-            elif col_name == "PRIORIDAD_ESTRATEGICA":
+            elif col_s == "Nivel de oportunidad":
                 val = str(cell.value or "")
-                fg, fc = PRIOR_FILLS.get(val, ("EEEEEE", "555555"))
+                fg, fc = NIVEL_FILLS.get(val, ("EEEEEE", "555555"))
                 cell.fill = PatternFill("solid", fgColor=fg)
                 cell.font = Font(bold=True, color=fc, name="Arial", size=10)
 
-            elif col_name == "SEÑAL_TENDENCIA":
-                val = str(cell.value or "")
-                fg, fc = SENAL_FILLS.get(val, ("EEEEEE", "888888"))
-                cell.fill = PatternFill("solid", fgColor=fg)
-                cell.font = Font(bold=True, color=fc, name="Arial", size=10)
+            elif col_s == "Puntuación (0-100)":
+                cell.number_format = "0.0"
+                try:
+                    v = float(cell.value)
+                    fc = "1A5C2A" if v >= 75 else ("7D4800" if v >= 55 else
+                                                    ("9C0006" if v < 35 else "000000"))
+                    cell.font = Font(bold=True, color=fc, name="Arial", size=10)
+                except (TypeError, ValueError):
+                    pass
 
-            elif col_name == "calificacion_final":
-                cell.fill = base_fill
+            elif col_s == "Calificación (1-5)":
                 cell.number_format = "0.00"
                 try:
                     v = float(cell.value)
@@ -4151,54 +4382,75 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
                 except (TypeError, ValueError):
                     pass
 
-            elif col_name in ("AAGR_ROBUSTO", f"var_yoy_{AÑO_FIN_DATOS}", "diferencial_tendencia",
-                              "distancia_costo_pct"):
-                cell.fill = base_fill
+            elif col_s == "Señal de tendencia":
+                val = str(cell.value or "")
+                fg, fc = SENAL_FILLS.get(val, ("EEEEEE", "888888"))
+                cell.fill = PatternFill("solid", fgColor=fg)
+                cell.font = Font(bold=True, color=fc, name="Arial", size=10)
+
+            elif col_s in ("AAGR (% anual)", "CAGR 2019-2024 (%)", "Var. último año (%)"):
                 cell.number_format = "0.0%"
                 cell.font = Font(name="Arial", size=10)
 
-            elif col_name in (f"suma_matricula_{AÑO_FIN_DATOS}", f"num_programas_{AÑO_FIN_DATOS}",
-                              f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"):
-                cell.fill = base_fill
+            elif col_s == "% Inscritos no matriculados":
+                cell.number_format = "0.0%"
+                cell.font = Font(name="Arial", size=10)
+
+            elif col_s == _col_pc_hdr:
                 cell.number_format = "#,##0"
                 cell.font = Font(name="Arial", size=10)
 
-            elif col_name in ("salario_promedio",):
-                cell.fill = base_fill
-                cell.number_format = "0.00"
+            elif col_s == "Salario prom. (SMLMV)":
+                cell.number_format = "0.0"
                 cell.font = Font(name="Arial", size=10)
 
-            elif col_name in ("costo_promedio",):
-                cell.fill = base_fill
+            elif col_s == "Costo prom. mercado ($)":
                 cell.number_format = "#,##0"
+                cell.font = Font(name="Arial", size=10)
+
+            elif col_s == "Distancia vs EAFIT (%)":
+                cell.number_format = '0.0"%"'
+                cell.font = Font(name="Arial", size=10)
+
+            elif col_s in ("N° programas en mercado", "Prog. nuevos (3 años)"):
+                cell.number_format = "#,##0"
+                cell.font = Font(name="Arial", size=10)
+
+            elif col_s == "Tasa de graduación":
+                cell.number_format = "0.0%"
                 cell.font = Font(name="Arial", size=10)
 
             else:
-                cell.fill = base_fill
                 cell.font = Font(name="Arial", size=10)
 
-    # Anchos de columna
-    anchos = {
-        "CATEGORIA_FINAL": 38,
-        "SEMAFORO": 16,
-        "PRIORIDAD_ESTRATEGICA": 22,
-        "calificacion_final": 14,
-        "AAGR_ROBUSTO": 13,
-        f"suma_matricula_{AÑO_FIN_DATOS}": 16,
-        "SEÑAL_TENDENCIA": 20,
-        "salario_promedio": 14,
-        f"num_programas_{AÑO_FIN_DATOS}": 14,
-        f"prom_matricula_por_programa_{AÑO_FIN_DATOS}": 18,
-        "costo_promedio": 14,
-        "distancia_costo_pct": 15,
-        "TIPO_CRECIMIENTO": 16,
+    ANCHOS = {
+        "Categoría de mercado": 36,
+        "Nivel predominante": 18,
+        "Semáforo": 12,
+        "Nivel de oportunidad": 20,
+        "Puntuación (0-100)": 14,
+        "Calificación (1-5)": 14,
+        _col_pc_hdr: 14,
+        "AAGR (% anual)": 13,
+        "CAGR 2019-2024 (%)": 13,
+        "Señal de tendencia": 20,
+        "Tipo de mercado": 16,
+        "Var. último año (%)": 14,
+        "% Inscritos no matriculados": 22,
+        "Salario prom. (SMLMV)": 18,
+        "Tasa de graduación": 16,
+        "N° programas en mercado": 20,
+        "Prog. nuevos (3 años)": 18,
+        "Costo prom. mercado ($)": 20,
+        "Distancia vs EAFIT (%)": 18,
     }
     for ci, col_name in enumerate(cols, start=1):
-        if col_name in anchos:
-            ws.column_dimensions[get_column_letter(ci)].width = anchos[col_name]
+        w = ANCHOS.get(str(col_name))
+        if w:
+            ws.column_dimensions[get_column_letter(ci)].width = w
 
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes = "C3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(len(cols))}2"
 
 
 def _escribir_hoja_total(
@@ -4214,49 +4466,119 @@ def _escribir_hoja_total(
     from openpyxl.styles import PatternFill as _PF
 
     NOMBRES_LEGIBLES = {
-        "calificacion_final": "Calificación",
-        "TIPO_CRECIMIENTO": "Tipo Crecim.",
-        f"prom_matricula_{AÑO_FIN_DATOS}": f"Prom. Mat. {AÑO_FIN_DATOS}",
-        f"participacion_{AÑO_FIN_DATOS}": "Participación",
-        "AAGR_ROBUSTO": "AAGR Robusto",
-        "salario_promedio": "Salario (SMLMV)",
-        f"pct_no_matriculados_{AÑO_FIN_DATOS}": f"% No Matr. {AÑO_FIN_DATOS}",
-        "FUENTE_PCT_NO_MAT": "Fuente % No Matr.",
-        f"num_programas_{AÑO_FIN_DATOS}": "N° Programas",
-        "distancia_costo_pct": "Dist. Costo %",
-        "score_matricula": "S. Mat",
-        "score_participacion": "S. Part",
-        "score_AAGR": "S. AAGR",
-        "score_salario": "S. Sal",
-        "score_pct_no_matriculados": "S. No-Mat",
-        "score_num_programas": "S. Prog",
-        "score_costo": "S. Costo",
-        f"suma_matricula_{AÑO_FIN_DATOS}": f"Matr. {AÑO_FIN_DATOS}",
-        f"suma_matricula_{AÑO_INICIO_HISTORICO}": f"Matr. {AÑO_INICIO_HISTORICO}",
-        "AAGR_suma": "AAGR Suma",
-        "CAGR_suma": "CAGR Suma",
-        "salario_proyectado_pesos_hoy": "Salario (Pesos)",
-        "costo_promedio": "Costo Prom.",
-        f"num_programas_{AÑO_INICIO_HISTORICO}": f"N° Prog. {AÑO_INICIO_HISTORICO}",
-        "programas_activos": "Prog. Activos",
-        "programas_inactivos": "Prog. Inactivos",
-        "programas_nuevos_3a": "Prog. Nuevos 3a",
-        "pct_con_matricula": "% Con Matr.",
-        f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa": f"Ins. {AÑO_FIN_DATOS - 1} Prom/Prog",
-        f"inscritos_{AÑO_FIN_DATOS}_prom_por_programa": f"Ins. {AÑO_FIN_DATOS} Prom/Prog",
-        "var_inscritos_prom": "Var. Ins. Prom",
         "CAT_ID": "ID Categoría",
+        "CATEGORIA_FINAL": "Categoría de mercado",
+        "FUENTE_CATEGORIA": "Fuente de categoría",
+        "NIVEL_MAYORIT": "Nivel predominante",
+        f"suma_matricula_{AÑO_INICIO_HISTORICO}": f"Matr. total {AÑO_INICIO_HISTORICO}",
+        f"suma_matricula_{AÑO_FIN_DATOS}": f"Matr. total {AÑO_FIN_DATOS}",
+        f"prom_matricula_{AÑO_INICIO_HISTORICO}": f"Prom. matr. {AÑO_INICIO_HISTORICO}",
+        f"prom_matricula_{AÑO_FIN_DATOS}": f"Prom. matr. {AÑO_FIN_DATOS}",
+        f"participacion_{AÑO_INICIO_HISTORICO}": f"Part. primer curso {AÑO_INICIO_HISTORICO}",
+        f"participacion_{AÑO_FIN_DATOS}": f"Part. primer curso {AÑO_FIN_DATOS}",
+        "AAGR_suma": "AAGR primer curso — suma del mercado",
+        "AAGR_prom": "AAGR primer curso — prom. por programa",
+        "CAGR_suma": "CAGR primer curso",
+        "AAGR_ROBUSTO": "AAGR primer curso (robusto)",
+        "TIPO_CRECIMIENTO": "Tipo de mercado",
+        "SEÑAL_TENDENCIA": "Señal tendencia actual",
+        f"suma_primer_curso_{AÑO_INICIO_HISTORICO}": f"Primer curso {AÑO_INICIO_HISTORICO}",
+        f"suma_primer_curso_{AÑO_FIN_DATOS}": f"Primer curso {AÑO_FIN_DATOS}",
+        f"prom_primer_curso_{AÑO_INICIO_HISTORICO}": (
+            f"Prom. primer curso {AÑO_INICIO_HISTORICO} (por registro)"
+        ),
+        f"prom_primer_curso_{AÑO_FIN_DATOS}": (
+            f"Prom. primer curso {AÑO_FIN_DATOS} (por registro)"
+        ),
+        "AAGR_primer_curso": "AAGR primer curso (histórico)",
+        f"inscritos_{AÑO_FIN_DATOS - 1}_suma": f"Inscritos suma {AÑO_FIN_DATOS - 1}",
+        f"inscritos_{AÑO_FIN_DATOS}_suma": f"Inscritos suma {AÑO_FIN_DATOS}",
+        f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa": (
+            f"Inscritos prom/prog {AÑO_FIN_DATOS - 1}"
+        ),
+        f"inscritos_{AÑO_FIN_DATOS}_prom_por_programa": (
+            f"Inscritos prom/prog {AÑO_FIN_DATOS}"
+        ),
+        f"pct_no_matriculados_{AÑO_FIN_DATOS - 1}": (
+            f"% No matriculados {AÑO_FIN_DATOS - 1}"
+        ),
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}": f"% No matriculados {AÑO_FIN_DATOS}",
+        "FUENTE_PCT_NO_MAT": "Fuente % no matr.",
+        "var_inscritos": f"Var. inscritos {AÑO_FIN_DATOS - 1}→{AÑO_FIN_DATOS}",
+        "var_inscritos_prom": (
+            f"Var. inscritos prom {AÑO_FIN_DATOS - 1}→{AÑO_FIN_DATOS}"
+        ),
+        "salario_promedio": "Salario promedio (SMLMV)",
+        "salario_proyectado_pesos_hoy": "Salario promedio (pesos hoy)",
+        f"num_programas_{AÑO_INICIO_HISTORICO}": (
+            f"Programas con dato {AÑO_INICIO_HISTORICO}"
+        ),
+        f"num_programas_{AÑO_FIN_DATOS}": f"Programas con dato {AÑO_FIN_DATOS}",
+        "programas_activos": "Registros con matrículas",
+        "programas_inactivos": "Registros sin matrículas",
+        "programas_nuevos_3a": "Prog. nuevos (últimos 3 años)",
+        "nuevos_vs_snapshot": "Nuevos vs año anterior",
+        "var_programas": (
+            f"Var. N° programas {AÑO_FIN_DATOS - 1}→{AÑO_FIN_DATOS}"
+        ),
+        "pct_con_matricula": "% Registros con matrícula",
+        "costo_promedio": "Costo prom. matrícula",
+        "distancia_costo_pct": "Distancia vs benchmark EAFIT (%)",
+        "score_matricula": "S. Primer curso",
+        "score_participacion": "S. Participación",
+        "score_AAGR": "S. AAGR",
+        "score_salario": "S. Salario",
+        "score_pct_no_matriculados": "S. No matriculados",
+        "score_num_programas": "S. N° Programas",
+        "score_costo": "S. Costo",
+        "calificacion_final": "Calificación final",
     }
+    for _y in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
+        NOMBRES_LEGIBLES.setdefault(f"suma_primer_curso_{_y}", f"Primer curso {_y}")
+
+    for _y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
+        NOMBRES_LEGIBLES.setdefault(
+            f"prom_primer_curso_{_y}",
+            f"Prom. primer curso {_y} (por registro)",
+        )
+
+    for _y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
+        NOMBRES_LEGIBLES.setdefault(
+            f"var_primer_curso_{_y}",
+            f"Var. suma primer curso {_y - 1}→{_y}",
+        )
+        NOMBRES_LEGIBLES.setdefault(
+            f"var_prom_primer_curso_{_y}",
+            f"Var. prom. por prog. {_y - 1}→{_y}",
+        )
+
+    NOMBRES_LEGIBLES["AAGR_suma"] = "AAGR primer curso — suma del mercado"
+    NOMBRES_LEGIBLES["AAGR_prom"] = "AAGR primer curso — prom. por programa"
+
+    for _y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
+        NOMBRES_LEGIBLES.setdefault(f"inscritos_{_y}_suma", f"Inscritos suma {_y}")
+        NOMBRES_LEGIBLES.setdefault(f"inscritos_{_y}_prom_por_programa", f"Inscritos prom/prog {_y}")
+        NOMBRES_LEGIBLES.setdefault(f"suma_matricula_{_y}", f"Matr. total {_y}")
+        NOMBRES_LEGIBLES.setdefault(f"prom_matricula_{_y}", f"Prom. matr. {_y}")
+
+    for _y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
+        for _s in (1, 2):
+            NOMBRES_LEGIBLES.setdefault(f"suma_matricula_{_y}_{_s}", f"Matr. total {_y} S{_s}")
+
+    for _y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1):
+        NOMBRES_LEGIBLES.setdefault(f"var_suma_{_y}", f"Var. matr. total suma {_y}")
+        NOMBRES_LEGIBLES.setdefault(f"var_prom_{_y}", f"Var. matr. total prom {_y}")
 
     COLORES_BLOQUES = {
-        "RESUMEN DECISIÓN": "000066",
         "CATEGORÍA": "37474F",
-        "OFERTA": "2E4057",
-        "MATRÍCULAS ANUALES": "546E7A",
-        "MATRÍCULAS SEMESTRALES": "78909C",
-        "DEMANDA NUEVA": "2E7D32",
+        "DEMANDA NUEVA — PRIMER CURSO": "2E7D32",
+        "PARTICIPACIÓN Y CRECIMIENTO": "1A5276",
         "INSCRITOS": "E65100",
-        "METADATA": "9E9E9E",
+        "SALARIO OLE": "5D4037",
+        "OFERTA DE PROGRAMAS": "2E4057",
+        "COSTO": "6A1B9A",
+        "SCORING — valor | puntuación": "000066",
+        "CALIFICACIÓN FINAL": "000066",
     }
     wb = writer.book
     # Posición canónica de la hoja: `total` va en índice 1 (justo después de
@@ -4396,10 +4718,45 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
                     else:
                         cell.font = _Font(name="Arial", size=10)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-            if col_name and ("participacion" in col_name or "pct_" in col_name or "var_" in col_name or "AAGR" in col_name or "CAGR" in col_name):
+            # Promedios de estudiantes (personas): enteros sin decimales
+            if col_name and (
+                "prom_primer_curso" in col_name
+                and not col_name.startswith("var_")
+                or col_name == f"prom_matricula_por_programa_{AÑO_FIN_DATOS}"
+                or ("inscritos" in col_name and "prom" in col_name)
+            ):
+                cell.number_format = "#,##0"
+            # Sumas de primer_curso y matrícula: enteros sin decimales
+            elif col_name and (
+                "suma_primer_curso" in col_name
+                or "suma_matricula" in col_name
+                or "num_programas" in col_name
+                or ("inscritos" in col_name and "suma" in col_name)
+            ):
+                cell.number_format = "#,##0"
+            # Salario SMLMV: 1 decimal (ej. 3.1, 4.5)
+            elif col_name == "salario_promedio":
+                cell.number_format = "0.0"
+            # Costo en pesos: sin centavos
+            elif col_name == "costo_promedio":
+                cell.number_format = "#,##0"
+            elif col_name == "salario_proyectado_pesos_hoy":
+                cell.number_format = "#,##0"
+            elif col_name == "distancia_costo_pct":
+                cell.number_format = '0.0"%"'
+            elif col_name and (
+                "var_primer_curso" in col_name or "var_prom_primer_curso" in col_name
+            ):
                 cell.number_format = pct_fmt
-            elif col_name and ("costo" in col_name or "salario" in col_name):
-                cell.number_format = moneda_fmt
+            # Porcentajes y tasas
+            elif col_name and (
+                "participacion" in col_name
+                or "pct_" in col_name
+                or "var_" in col_name
+                or "AAGR" in col_name
+                or "CAGR" in col_name
+            ) and not col_name.startswith("score_"):
+                cell.number_format = pct_fmt
             elif col_name and col_name.startswith("score_"):
                 cell.number_format = score_fmt
             elif col_name == "calificacion_final":
@@ -4419,7 +4776,66 @@ def _aplicar_formato_total(ws, col_order: list[str]) -> None:
                 )
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    ws.freeze_panes = "B3"
+    _ANCHOS_TOTAL = {
+        "CAT_ID": 8,
+        "CATEGORIA_FINAL": 42,
+        "FUENTE_CATEGORIA": 14,
+        "NIVEL_MAYORIT": 22,
+        **{f"suma_primer_curso_{y}": 13
+           for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)},
+        **{f"prom_primer_curso_{y}": 18
+           for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1)},
+        **{f"var_primer_curso_{y}": 16
+           for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)},
+        **{f"var_prom_primer_curso_{y}": 18
+           for y in range(AÑO_INICIO_HISTORICO + 1, AÑO_FIN_DATOS + 1)},
+        f"participacion_{AÑO_INICIO_HISTORICO}": 16,
+        f"participacion_{AÑO_FIN_DATOS}": 16,
+        "AAGR_suma": 18,
+        "AAGR_prom": 18,
+        "CAGR_suma": 16,
+        "AAGR_ROBUSTO": 18,
+        "TIPO_CRECIMIENTO": 18,
+        "SEÑAL_TENDENCIA": 22,
+        f"inscritos_{AÑO_FIN_DATOS - 1}_suma": 16,
+        f"inscritos_{AÑO_FIN_DATOS}_suma": 16,
+        f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa": 18,
+        f"inscritos_{AÑO_FIN_DATOS}_prom_por_programa": 18,
+        f"pct_no_matriculados_{AÑO_FIN_DATOS - 1}": 18,
+        f"pct_no_matriculados_{AÑO_FIN_DATOS}": 18,
+        "FUENTE_PCT_NO_MAT": 22,
+        "var_inscritos": 16,
+        "var_inscritos_prom": 18,
+        "salario_promedio": 18,
+        "salario_proyectado_pesos_hoy": 20,
+        f"num_programas_{AÑO_INICIO_HISTORICO}": 18,
+        f"num_programas_{AÑO_FIN_DATOS}": 18,
+        "programas_activos": 20,
+        "programas_inactivos": 20,
+        "programas_nuevos_3a": 22,
+        "nuevos_vs_snapshot": 18,
+        "var_programas": 18,
+        "pct_con_matricula": 22,
+        "costo_promedio": 18,
+        "distancia_costo_pct": 24,
+        "score_matricula": 9,
+        "score_participacion": 9,
+        "score_AAGR": 9,
+        "score_salario": 9,
+        "score_pct_no_matriculados": 9,
+        "score_num_programas": 9,
+        "score_costo": 9,
+        "calificacion_final": 16,
+    }
+
+    from openpyxl.utils import get_column_letter as _gcl2
+
+    for _ci, _col in enumerate(col_order, start=1):
+        _w = _ANCHOS_TOTAL.get(_col)
+        if _w:
+            ws.column_dimensions[_gcl2(_ci)].width = _w
+
+    ws.freeze_panes = "C3"
     ws.auto_filter.ref = ws.dimensions
 
 
@@ -4664,30 +5080,151 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
             f"Programas que Requieren Revisión Manual — {len(df_revision):,} registros (confianza KNN < 50%)",
         )
 
-    # Hoja leyenda
+    # ── Hoja Leyenda ─────────────────────────────────────────────────────────
     ws_ley = wb.create_sheet("Leyenda")
-    leyenda = [
-        ("Color", "Fuente de categoría", "Significado"),
-        ("🟢 Verde", "CRUCE_SNIES", "Categoría por cruce exacto de código SNIES. Certeza 100%."),
-        ("🟢 Verde", "MATCH_NOMBRE", "Categoría por coincidencia exacta de nombre. Certeza 100%."),
-        ("🟢 Verde", "MATCH_CATEGORIA", "Nombre coincide directamente con una categoría. Certeza 100%."),
-        ("🟡 Amarillo", "KNN_TFIDF (≥50%)", "Categoría por KNN+TF-IDF. Confianza ≥ 50%. Aceptable."),
-        ("🔴 Rojo", "KNN_TFIDF (<50%)", "Categoría por KNN. Confianza < 50%. Requiere revisión manual."),
+
+    FILAS_METODOLOGIA = [
+        ("METODOLOGÍA", "Definición", "Detalle"),
+        (
+            "Primer curso",
+            "Nuevos estudiantes matriculados",
+            "Suma de primer_curso semestral del SNIES. Es el indicador principal "
+            "de demanda real de un mercado. Equivale a los nuevos matriculados en "
+            "el año (S1 + S2). Diferente de matrícula total (que incluye "
+            "estudiantes de todos los semestres).",
+        ),
+        (
+            "AAGR primer curso (robusto)",
+            "Crecimiento anual histórico del mercado",
+            "Average Annual Growth Rate calculado sobre primer_curso 2019-2024. "
+            "Formula: promedio de las variaciones interanuales "
+            "(2019-2020, 2020-2021, ..., 2023-2024). "
+            "Para categorias nuevas (sin dato en 2019), se calcula desde el "
+            "primer año con dato. El pipeline calcula este indicador "
+            "correctamente. El AAGR del archivo manual de referencia tenia un "
+            "error de formula (AVERAGE/5) que producia valores 5 veces menores "
+            "al valor real.",
+        ),
+        (
+            "Señal tendencia actual",
+            "Momento actual del mercado (ultimo año)",
+            "Basada en la variacion primer_curso 2023-2024 (YoY). "
+            "ACELERANDO: crecimiento mayor a 10% en el ultimo año. "
+            "ESTABLE: variacion entre -10% y +10%. "
+            "EN DECLIVE: caida en el ultimo año. "
+            "CONTRACCION: caida fuerte. "
+            "COMPLEMENTA el AAGR historico: una categoria puede tener buen AAGR "
+            "(crecio 5 años) pero señal EN DECLIVE (cayo este año), o viceversa. "
+            "Ambas metricas son validas y complementarias.",
+        ),
+        (
+            "Registros con matriculas vs Programas con dato",
+            "Dos conteos distintos de programas",
+            "Registros con matriculas: filas unicas en SNIES con matricula mayor "
+            "a 0 en 2024. Un mismo programa SNIES puede generar multiples "
+            "registros si se ofrece en varias ciudades o modalidades. "
+            "Programas con dato 2024: codigos SNIES unicos con primer_curso "
+            "mayor a 0. Es normal que Registros sea mayor a Programas unicos.",
+        ),
+        (
+            "Prom. primer curso (por registro)",
+            "Promedio de primer_curso sobre registros individuales",
+            "suma_primer_curso dividido por n_registros_con_dato. El denominador "
+            "incluye cada combinacion programa, modalidad, municipio y semestre. "
+            "No es equivalente a suma dividido por n_programas_unicos. "
+            "El scoring S. Primer curso usa esta cifra de forma consistente "
+            "en todas las categorias.",
+        ),
+        (
+            "Distancia vs benchmark EAFIT (%)",
+            "Cuanto cuesta el mercado vs lo que cobra EAFIT",
+            "Formula: (Costo promedio del mercado menos Benchmark EAFIT) "
+            "dividido por Benchmark EAFIT, por 100. "
+            "Negativo: el mercado es mas barato que EAFIT (EAFIT tiene margen "
+            "de precio). Positivo: el mercado cobra mas que EAFIT. "
+            "Benchmarks: ESP universitaria 11910000, "
+            "ESP Medico-Quirurgica 31895490, Maestria 13686800.",
+        ),
+        (
+            "Pct Registros con matricula",
+            "Fraccion de registros SNIES activos con matricula real",
+            "Registros con matricula dividido por la suma de Registros con "
+            "matricula mas Registros sin matricula. Siempre entre 0% y 100%. "
+            "Un valor bajo indica que muchos programas registrados no tienen "
+            "estudiantes activos.",
+        ),
     ]
-    bg_map_ley = {"🟢 Verde": "C6EFCE", "🟡 Amarillo": "FFF2CC", "🔴 Rojo": "FFC7CE"}
-    for ri, (col_ley, fuente_ley, sig_ley) in enumerate(leyenda, start=1):
-        for ci_ley, val_ley in enumerate([col_ley, fuente_ley, sig_ley], start=1):
-            cell_ley = ws_ley.cell(row=ri, column=ci_ley, value=val_ley)
-            if ri == 1:
-                cell_ley.font = Font(bold=True, color="FFFFFF")
-                cell_ley.fill = PatternFill(start_color=AZUL, end_color=AZUL, fill_type="solid")
-            else:
-                bg_ley = bg_map_ley.get(col_ley, BLANCO)
-                if bg_ley != BLANCO:
-                    cell_ley.fill = PatternFill(start_color=bg_ley, end_color=bg_ley, fill_type="solid")
-    ws_ley.column_dimensions["A"].width = 16
-    ws_ley.column_dimensions["B"].width = 22
-    ws_ley.column_dimensions["C"].width = 70
+
+    FILAS_FUENTES = [
+        ("Color", "Fuente de categoria", "Significado"),
+        ("Verde", "CRUCE_SNIES", "Categoria por cruce exacto de codigo SNIES. Certeza 100%."),
+        ("Verde", "MATCH_NOMBRE", "Categoria por coincidencia exacta de nombre. Certeza 100%."),
+        ("Verde", "MATCH_CATEGORIA", "Nombre coincide directamente con una categoria. Certeza 100%."),
+        ("Amarillo", "KNN_TFIDF (>=50%)", "Categoria por KNN+TF-IDF. Confianza >= 50%. Aceptable."),
+        ("Rojo", "KNN_TFIDF (<50%)", "Categoria por KNN. Confianza < 50%. Requiere revision manual."),
+    ]
+
+    def _celda_texto(ws, row: int, col: int, texto: object):
+        """
+        Escribe una celda como texto puro (data_type='s'), nunca como fórmula.
+        Evita corrupción XML cuando el texto contiene =, /, flechas u otros símbolos.
+        """
+        cell = ws.cell(row=row, column=col)
+        valor_limpio = str(texto).strip() if texto is not None else ""
+        if valor_limpio.startswith("="):
+            valor_limpio = valor_limpio.lstrip("=").strip()
+        cell.value = valor_limpio
+        cell.data_type = "s"
+        return cell
+
+    fila_actual = 1
+    for tupla in FILAS_METODOLOGIA:
+        nombre, definicion, detalle = tupla
+        c_nom = _celda_texto(ws_ley, fila_actual, 1, nombre)
+        c_def = _celda_texto(ws_ley, fila_actual, 2, definicion)
+        c_det = _celda_texto(ws_ley, fila_actual, 3, detalle)
+
+        if fila_actual == 1:
+            for cell in (c_nom, c_def, c_det):
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill(start_color=AZUL, end_color=AZUL, fill_type="solid")
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        else:
+            for cell in (c_nom, c_def, c_det):
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            c_nom.font = Font(bold=True)
+
+        fila_actual += 1
+
+    fila_actual += 1  # fila en blanco de separación
+
+    BG_FUENTE = {"Verde": "C6EFCE", "Amarillo": "FFF2CC", "Rojo": "FFC7CE"}
+    emoji_map = {"Verde": "🟢 Verde", "Amarillo": "🟡 Amarillo", "Rojo": "🔴 Rojo"}
+
+    for tupla in FILAS_FUENTES:
+        color_key, fuente, significado = tupla
+        c_col = _celda_texto(ws_ley, fila_actual, 1, color_key)
+        c_fue = _celda_texto(ws_ley, fila_actual, 2, fuente)
+        c_sig = _celda_texto(ws_ley, fila_actual, 3, significado)
+
+        if color_key == "Color":
+            for cell in (c_col, c_fue, c_sig):
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill(start_color=AZUL, end_color=AZUL, fill_type="solid")
+        else:
+            bg = BG_FUENTE.get(color_key, BLANCO)
+            if bg != BLANCO:
+                for cell in (c_col, c_fue, c_sig):
+                    cell.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
+            if color_key in emoji_map:
+                c_col.value = emoji_map[color_key]
+                c_col.data_type = "s"
+
+        fila_actual += 1
+
+    ws_ley.column_dimensions["A"].width = 36
+    ws_ley.column_dimensions["B"].width = 28
+    ws_ley.column_dimensions["C"].width = 80
 
     wb.save(str(ruta_salida))
 

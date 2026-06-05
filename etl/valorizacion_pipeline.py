@@ -105,10 +105,8 @@ def _get_or_assign_prog_id(programas: list[str]) -> dict[str, str]:
 # se estima capturará un programa nuevo de EAFIT en su primer año de operación.
 TASA_CAPTURA_EAFIT: float = 0.35
 
-# ANO_LANZAMIENTO sugerido por el sistema según urgencia de mercado.
-# Derivado de AÑO_FIN_DATOS: urgente = +2 años, normal = +3 años.
-_ANO_LANZAMIENTO_URGENTE: int = AÑO_FIN_DATOS + 2
-_ANO_LANZAMIENTO_NORMAL: int = AÑO_FIN_DATOS + 3
+# Horizonte fijo de proyección de primer curso (sin año de lanzamiento por programa).
+_AÑO_PROYECCION_REGRESION: int = AÑO_FIN_DATOS + 2
 
 # ── Definición de segmentos regionales (alineado con run_segmentos_regionales / nombres de parquet) ──
 COL_DEPT = "DEPARTAMENTO_OFERTA_PROGRAMA"
@@ -212,6 +210,11 @@ def _leer_programas_eafit(log: Callable) -> pd.DataFrame:
     if "TIENE_ESTUDIO_MERCADO" not in df.columns:
         df["TIENE_ESTUDIO_MERCADO"] = "No"
 
+    # Normalizar CATEGORIA_RAW antes del dedup para que variaciones de capitalización
+    # no generen filas duplicadas (ej: "Inteligencia Artificial" == "INTELIGENCIA ARTIFICIAL")
+    df["CATEGORIA_RAW"] = df["CATEGORIA_RAW"].astype(str).str.strip().str.upper()
+    df["NIVEL"] = df["NIVEL"].astype(str).str.strip()
+    df["PROGRAMA_EAFIT"] = df["PROGRAMA_EAFIT"].astype(str).str.strip()
     df = (
         df.dropna(subset=["PROGRAMA_EAFIT"])
         .drop_duplicates(subset=["PROGRAMA_EAFIT", "CATEGORIA_RAW"])
@@ -265,6 +268,7 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
         "programas_inactivos": 0,
         "costo_promedio": np.nan,
         "pct_con_matricula": 0.0,
+        "SEÑAL_TENDENCIA": np.nan,
         # Campos adicionales para scoring correcto en _score_y_calificacion
         "score_participacion": 1,        # pre-calculado sobre 288 cats; 1-fila colapsa a score 1
         "NIVEL_MAYORIT": "ESPECIALIZACIÓN",  # necesario para árbol de decisión AAGR ESP vs MAE
@@ -336,6 +340,11 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
                 if "NIVEL_MAYORIT" in row.index and pd.notna(row["NIVEL_MAYORIT"])
                 else "ESPECIALIZACIÓN"
             ),
+            "SEÑAL_TENDENCIA": (
+                str(row["SEÑAL_TENDENCIA"]).strip()
+                if "SEÑAL_TENDENCIA" in row.index and pd.notna(row["SEÑAL_TENDENCIA"])
+                else np.nan
+            ),
         }
         resultados.append(met)
 
@@ -358,6 +367,10 @@ def _lookup_categoria(ag: pd.DataFrame | None, categorias: list[str]) -> dict:
         if k == "NIVEL_MAYORIT":
             niveles = [m[k] for m in resultados if m.get(k)]
             prom[k] = max(set(niveles), key=niveles.count) if niveles else "ESPECIALIZACIÓN"
+            continue
+        if k == "SEÑAL_TENDENCIA":
+            señales = [m[k] for m in resultados if isinstance(m.get(k), str) and m.get(k)]
+            prom[k] = max(set(señales), key=señales.count) if señales else np.nan
             continue
         # score_participacion: redondear el promedio (es entero 1-5)
         vals = [m[k] for m in resultados if pd.notna(m.get(k))]
@@ -622,7 +635,7 @@ def _proyeccion_regresion_lineal(
 
     Args:
         serie_pc: {año: promedio_primer_curso} — solo años con datos válidos.
-        año_objetivo: año al que se proyecta (ANO_LANZAMIENTO del programa).
+        año_objetivo: año al que se proyecta (horizonte fijo AÑO_FIN_DATOS + 2).
         tasa_captura: fracción del mercado que capturaría EAFIT (TASA_CAPTURA_EAFIT).
 
     Returns:
@@ -707,8 +720,18 @@ def _agregar_metricas_categoria(
         return resultados_por_cat[0]
 
     # Promediar métricas de múltiples categorías
-    met_prom = {}
+    met_prom: dict = {}
     for k in resultados_por_cat[0]:
+        if k == "serie_primer_curso":
+            met_prom[k] = resultados_por_cat[0].get(k, {})
+            continue
+        if k == "SEÑAL_TENDENCIA":
+            señales = [
+                m[k] for m in resultados_por_cat
+                if isinstance(m.get(k), str) and m.get(k)
+            ]
+            met_prom[k] = max(set(señales), key=señales.count) if señales else np.nan
+            continue
         vals = [m[k] for m in resultados_por_cat if pd.notna(m.get(k))]
         met_prom[k] = float(np.mean(vals)) if vals else np.nan
     return met_prom
@@ -767,7 +790,10 @@ def _metricas_de_subconjunto(sub: pd.DataFrame, df_region_completo: pd.DataFrame
     pct_no_mat = np.nan
     # Fórmula: (inscritos - primer_curso) / inscritos
     # NO comparar vs matricula_total (genera negativos porque acumula cohortes previas)
-    _ins_col = next((c for c in [f"inscritos_{AÑO_FIN_DATOS}_suma", f"inscritos_{AÑO_FIN_DATOS}"] if c in sub.columns), None)
+    _ins_col = next(
+        (c for c in [f"inscritos_{AÑO_FIN_DATOS}", f"inscritos_{AÑO_FIN_DATOS}_suma"] if c in sub.columns),
+        None,
+    )
     _pc_col_pct = next((c for c in [f"primer_curso_{AÑO_FIN_DATOS}"] if c in sub.columns), None)
     if _ins_col and _pc_col_pct:
         ins = float(sub[_ins_col].sum())
@@ -880,6 +906,73 @@ def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
     El parámetro sabana se conserva por compatibilidad de firma.
     """
     del sabana  # no se usa; datos desde backups SNIES
+
+    CONTEXTOS = {
+        "Colombia — Todo el mercado": (
+            "Universo completo del mercado nacional de posgrado y pregrado.\n"
+            "Incluye todas las metodologías (presencial, virtual, a distancia "
+            "e híbrida) y todos los sectores de IES (pública y privada).\n"
+            "Referencia de demanda bruta sin ningún filtro: útil para medir "
+            "el tamaño real del mercado y las tendencias de largo plazo."
+        ),
+        "Colombia — No Virtual · Todos sectores": (
+            "Excluye programas 100% virtuales.\n"
+            "Muestra la evolución de la demanda presencial, a distancia "
+            "e híbrida a nivel nacional.\n"
+            "Contexto relevante para entender cuánto del crecimiento nacional "
+            "corresponde a la virtualidad vs. la oferta tradicional."
+        ),
+        "Colombia — Presencial puro · Todos sectores": (
+            "Solo programas presenciales puros, toda clase de IES.\n"
+            "Es el segmento más cercano al modelo educativo de EAFIT y de "
+            "sus competidores directos (Uniandes, ICESI, Rosario, Javeriana).\n"
+            "Los CAGRs negativos post-2019 reflejan la migración de estudiantes "
+            "hacia la virtualidad, especialmente en Especialización."
+        ),
+        "Colombia — Virtual · Todos sectores": (
+            "Solo programas 100% virtuales a nivel nacional.\n"
+            "Segmento de mayor crecimiento: compite por el perfil de estudiante "
+            "trabajador que busca flexibilidad horaria.\n"
+            "El salto de 2018-2019 (+93%) refleja la consolidación de plataformas "
+            "virtuales; el de 2020-2021 (+19%) el efecto pandemia."
+        ),
+        "Colombia — Privada · Presencial puro": (
+            "IES privadas, modalidad presencial exclusivamente.\n"
+            "Competencia directa de EAFIT a nivel nacional: universidades privadas "
+            "de calidad con campus físico.\n"
+            "Benchmark para fijar participación de mercado esperada en nuevos "
+            "programas presenciales."
+        ),
+        "Colombia — Privada · Virtual": (
+            "IES privadas en modalidad 100% virtual.\n"
+            "Muestra el crecimiento de la oferta digital de competidores privados "
+            "directos de EAFIT.\n"
+            "Relevante para programas de EAFIT que podrían tener versión virtual "
+            "o enfrentar sustitución por parte de esta oferta."
+        ),
+        "Antioquia — Todo el mercado": (
+            "Mercado regional de Antioquia, todas metodologías y sectores.\n"
+            "Zona de influencia primaria de EAFIT: el mercado local más relevante "
+            "para evaluar demanda de nuevos programas presenciales.\n"
+            "El CAGR 2019-2024 negativo en Especialización refleja pérdida de "
+            "estudiantes hacia Bogotá y plataformas virtuales nacionales."
+        ),
+        "Bogotá — Todo el mercado": (
+            "Capital del país y mercado más grande (≈49% del mercado nacional "
+            "en Especialización y Maestría).\n"
+            "Refleja tendencias con antelación al resto del país.\n"
+            "Relevante para programas EAFIT con modalidad virtual o planes de "
+            "expansión fuera de Antioquia."
+        ),
+        "Eje Cafetero — Todo el mercado": (
+            "Caldas, Risaralda y Quindío.\n"
+            "Zona de influencia secundaria de EAFIT; mercado relevante para "
+            "programas que pueden atraer estudiantes de Manizales, Pereira y "
+            "Armenia.\n"
+            "Tamaño pequeño pero con buena tasa de crecimiento reciente en "
+            "Maestría (CAGR 2021-2024: +2.2%)."
+        ),
+    }
 
     años = list(range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1))
     yr_ini = años[0]
@@ -1171,7 +1264,12 @@ def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
         mod_txt = " · ".join(mod_f) if mod_f else "(Todas)"
         dpto_txt = ", ".join(dpto_f) if dpto_f else "(Todos)"
 
-        filas.append({"__tipo": "header", "__campo": "SEGMENTO", "__valor": nombre})
+        filas.append({
+            "__tipo": "header",
+            "__campo": "SEGMENTO",
+            "__valor": nombre,
+            "__contexto": CONTEXTOS.get(nombre, ""),
+        })
         filas.append({"__tipo": "header", "__campo": "SECTOR IES", "__valor": sector_txt})
         filas.append({"__tipo": "header", "__campo": "METODOLOGÍA", "__valor": mod_txt})
         filas.append({"__tipo": "header", "__campo": "DEPARTAMENTO", "__valor": dpto_txt})
@@ -1198,6 +1296,458 @@ def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
         filas.append({"__tipo": "blank"})
 
     return pd.DataFrame(filas)
+
+
+def _construir_hoja_proyecciones(
+    df_programas_val: pd.DataFrame,
+    sabana: pd.DataFrame | None,
+    log: Callable = print,
+) -> pd.DataFrame:
+    """
+    Construye la hoja Proyecciones con horizonte 2027-2031.
+
+    Una fila por programa EAFIT: P1 (regresión × participación) y
+    P2 (análogos P25 / mediana / P75 o CAGR fallback).
+    """
+    from unidecode import unidecode
+
+    AÑOS_DATOS = list(range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1))
+    AÑOS_PROY = [2027, 2028, 2029, 2030, 2031]
+    N_MIN = 2
+    N_AÑOS_MIN = 3
+
+    def _n(s: object) -> str:
+        s = str(s).upper().strip()
+        s = unidecode(s)
+        s = _re.sub(r"[^A-Z0-9\s]", " ", s)
+        return _re.sub(r"\s+", " ", s).strip()
+
+    log("  [Proyecciones] Cargando series históricas primer_curso...")
+
+    def _keys_sin_acento(keys: list[str]) -> dict[str, str]:
+        return {
+            k: "".join(
+                c for c in _ud.normalize("NFD", k) if _ud.category(c) != "Mn"
+            )
+            for k in keys
+        }
+
+    def _detectar_cols_programa(columns: list[str]) -> tuple[str | None, str | None, str | None]:
+        """IES, programa académico, primer curso — desde nombres de columna SNIES."""
+        keys = [str(c).upper().replace("\n", " ").strip() for c in columns]
+        kn = _keys_sin_acento(keys)
+
+        col_ies = next(
+            (
+                keys[i]
+                for i, k in enumerate(keys)
+                if "INSTITUC" in kn[k]
+                and "IES" in kn[k]
+                and "PADRE" not in kn[k]
+                and not k.startswith("ID")
+            ),
+            None,
+        )
+        col_prog = next(
+            (
+                keys[i]
+                for i, k in enumerate(keys)
+                if "PROGRAMA" in kn[k]
+                and "ACAD" in kn[k]
+                and "CODIGO" not in kn[k]
+                and "ACRED" not in kn[k]
+                and not k.startswith("ID")
+            ),
+            None,
+        )
+        if col_prog is None:
+            col_prog = next(
+                (
+                    keys[i]
+                    for i, k in enumerate(keys)
+                    if "PROGRAMA" in kn[k]
+                    and "CODIGO" not in kn[k]
+                    and "ACRED" not in kn[k]
+                    and not k.startswith("ID")
+                ),
+                None,
+            )
+        col_pc = next(
+            (keys[i] for i, k in enumerate(keys) if "PRIMER" in kn[k]),
+            None,
+        )
+        return col_ies, col_prog, col_pc
+
+    filas_hist: list[pd.DataFrame] = []
+    for yr in AÑOS_DATOS:
+        candidatos = [
+            REF_DIR / "backup" / "matriculas primer curso" / f"primer_curso_{yr}.xlsx",
+            REF_DIR / "backup" / f"primer_curso_{yr}.xlsx",
+            RAW_HISTORIC_DIR / f"primer_curso_{yr}.xlsx",
+            REF_DIR / f"primer_curso_{yr}.xlsx",
+        ]
+        ruta = next((p for p in candidatos if p.exists()), None)
+        if ruta is None:
+            continue
+        try:
+            import openpyxl as _opxl
+
+            _wb = _opxl.load_workbook(ruta, read_only=True, data_only=True)
+            _hoja = next(
+                (s for s in _wb.sheetnames if "NDICE" not in s.upper()),
+                _wb.sheetnames[-1],
+            )
+            _wb.close()
+
+            _df_raw: pd.DataFrame | None = None
+            _hdr_ok: int | None = None
+            for hdr in range(5, 13):
+                try:
+                    _cand = pd.read_excel(
+                        ruta, sheet_name=_hoja, header=hdr, dtype=str, nrows=5
+                    )
+                    _col_ies, _col_prog, _col_pc = _detectar_cols_programa(
+                        list(_cand.columns)
+                    )
+                    if all([_col_ies, _col_prog, _col_pc]):
+                        _hdr_ok = hdr
+                        break
+                except Exception:
+                    continue
+
+            if _hdr_ok is None:
+                continue
+
+            _df_raw = pd.read_excel(
+                ruta, sheet_name=_hoja, header=_hdr_ok, dtype=str
+            )
+            _col_ies, _col_prog, _col_pc = _detectar_cols_programa(list(_df_raw.columns))
+            if not all([_col_ies, _col_prog, _col_pc]):
+                continue
+
+            _df_raw["_PC"] = pd.to_numeric(_df_raw[_col_pc], errors="coerce").fillna(0)
+            _df_raw["_IES"] = _df_raw[_col_ies].apply(_n)
+            _df_raw["_PROG"] = _df_raw[_col_prog].apply(_n)
+            _df_raw["_AÑO"] = yr
+
+            _grp = (
+                _df_raw.groupby(["_IES", "_PROG", "_AÑO"])["_PC"]
+                .sum()
+                .reset_index()
+            )
+            filas_hist.append(_grp)
+        except Exception as e:
+            log_warning(f"  [Proyecciones] {yr}: lectura auxiliar fallida — {e}")
+            continue
+
+    if not filas_hist:
+        log_warning("  [Proyecciones] No se cargaron datos históricos. Hoja vacía.")
+        return pd.DataFrame()
+
+    df_hist = pd.concat(filas_hist, ignore_index=True)
+    df_hist.columns = ["IES", "PROGRAMA", "AÑO", "PC"]
+
+    pv = (
+        df_hist.groupby(["IES", "PROGRAMA", "AÑO"])["PC"]
+        .sum()
+        .reset_index()
+        .pivot_table(
+            index=["IES", "PROGRAMA"], columns="AÑO", values="PC", fill_value=0
+        )
+        .reset_index()
+    )
+    for yr in AÑOS_DATOS:
+        if yr not in pv.columns:
+            pv[yr] = 0.0
+
+    pv["n_años"] = (pv[AÑOS_DATOS] > 0).sum(axis=1)
+    pv["año_inicio"] = pv[AÑOS_DATOS].apply(
+        lambda r: next((yr for yr in AÑOS_DATOS if r[yr] > 0), None), axis=1
+    )
+
+    mask_eafit = pv["IES"].str.contains("EAFIT", na=False)
+    pv_eafit = pv[mask_eafit].copy()
+    pv_otros = pv[~mask_eafit].copy()
+
+    log(
+        f"  [Proyecciones] EAFIT: {len(pv_eafit)} programas "
+        f"({(pv_eafit['n_años'] >= N_AÑOS_MIN).sum()} con >={N_AÑOS_MIN} años) | "
+        f"IES referentes: {len(pv_otros)} "
+        f"({(pv_otros['n_años'] >= N_AÑOS_MIN).sum()} con >={N_AÑOS_MIN} años)"
+    )
+
+    df_v = df_programas_val[
+        df_programas_val["PROGRAMA_EAFIT"].notna()
+        & (df_programas_val["PROGRAMA_EAFIT"] != "Programa EAFIT")
+    ].copy()
+    df_v["_PROG_NORM"] = df_v["PROGRAMA_EAFIT"].apply(_n)
+    df_v["_CAT"] = df_v["CATEGORIA"].astype(str).str.upper().str.strip()
+    prog_a_cat = (
+        df_v[["_PROG_NORM", "_CAT"]]
+        .drop_duplicates()
+        .set_index("_PROG_NORM")["_CAT"]
+        .to_dict()
+    )
+    cat_a_progs_eafit: dict[str, list[str]] = {}
+    for p, c in prog_a_cat.items():
+        cat_a_progs_eafit.setdefault(c, []).append(p)
+
+    _pares_path = REF_DIR / "backup" / "posParesPositivos.csv"
+    if not _pares_path.exists():
+        _pares_path = REF_DIR / "posParesPositivos.csv"
+
+    pv_pares_cat: pd.DataFrame | None = None
+    if _pares_path.exists():
+        try:
+            df_pares = pd.read_csv(_pares_path)
+            df_pares["_PROG_PAR_N"] = df_pares["NOMBRE_DEL_PROGRAMA"].apply(_n)
+            df_pares["_PROG_EAFIT_N"] = df_pares["NombrePrograma EAFIT"].apply(_n)
+            df_pares["_CAMPO_EAFIT"] = df_pares["CAMPO_AMPLIO_EAFIT"].apply(_n)
+            df_pares["_CATEGORIA"] = df_pares["_PROG_EAFIT_N"].map(prog_a_cat)
+            pv_pares_cat = pv_otros.merge(
+                df_pares[
+                    ["_PROG_PAR_N", "_PROG_EAFIT_N", "_CAMPO_EAFIT", "_CATEGORIA"]
+                ].drop_duplicates("_PROG_PAR_N"),
+                left_on="PROGRAMA",
+                right_on="_PROG_PAR_N",
+                how="left",
+            )
+            log(
+                f"  [Proyecciones] Pares mapeados: "
+                f"{int(pv_pares_cat['_CATEGORIA'].notna().sum())} con categoría directa"
+            )
+        except Exception as e:
+            log_warning(f"  [Proyecciones] No se pudo cargar posParesPositivos: {e}")
+
+    serie_por_cat: dict[str, dict[int, float]] = {}
+    if sabana is not None:
+        try:
+            pc_cols_sab = {
+                yr: f"primer_curso_{yr}"
+                for yr in AÑOS_DATOS
+                if f"primer_curso_{yr}" in sabana.columns
+            }
+            cat_col = "CATEGORIA_FINAL"
+            if cat_col in sabana.columns and pc_cols_sab:
+                for cat, grp in sabana.groupby(cat_col):
+                    serie_por_cat[str(cat).upper().strip()] = {
+                        yr: float(grp[col].fillna(0).sum())
+                        for yr, col in pc_cols_sab.items()
+                    }
+                log(
+                    f"  [Proyecciones] Series de categoría desde sábana: "
+                    f"{len(serie_por_cat)}"
+                )
+        except Exception as e:
+            log_warning(f"  [Proyecciones] Error leyendo series de sábana: {e}")
+
+    if not serie_por_cat:
+        _total_nacional = df_hist.groupby("AÑO")["PC"].sum().to_dict()
+        serie_por_cat = {cat: dict(_total_nacional) for cat in set(prog_a_cat.values())}
+        log_warning(
+            "  [Proyecciones] Serie de categoría desde total nacional (fallback)."
+        )
+
+    def _reg_lineal(serie: dict[int, float], año_target: int) -> float | None:
+        xs = [yr for yr in AÑOS_DATOS if serie.get(yr, 0) > 0]
+        ys = [serie[yr] for yr in xs]
+        if len(xs) < 3:
+            return None
+        a, b = np.polyfit(np.array(xs, float), np.array(ys, float), 1)
+        return max(0.0, round(a * año_target + b, 1))
+
+    def _participacion_eafit(cat: str, prog_norm: str) -> float:
+        serie_mkt = serie_por_cat.get(cat, {})
+        eafit_rows = pv_eafit[pv_eafit["PROGRAMA"] == prog_norm]
+        fracs = []
+        for yr in AÑOS_DATOS[-4:]:
+            pc_e = (
+                float(eafit_rows[yr].sum())
+                if (not eafit_rows.empty and yr in eafit_rows.columns)
+                else 0.0
+            )
+            pc_m = float(serie_mkt.get(yr, 0))
+            if pc_m > 0 and pc_e > 0:
+                fracs.append(pc_e / pc_m)
+        return float(np.mean(fracs)) if fracs else 0.01
+
+    def _curva_norm(row: pd.Series, n: int = 5) -> list[float] | None:
+        yr_ini = row.get("año_inicio")
+        if yr_ini is None:
+            return None
+        base = float(row.get(yr_ini, 0))
+        if base <= 0:
+            return None
+        curva = [float(row.get(yr_ini + i, 0)) / base for i in range(n)]
+        return curva if len(curva) == n else None
+
+    def _get_curvas(cat: str, prog_norm: str) -> tuple[list[list[float]], str]:
+        curvas: list[list[float]] = []
+
+        if pv_pares_cat is not None:
+            mask_c1 = (pv_pares_cat["_CATEGORIA"] == cat) & (
+                pv_pares_cat["n_años"] >= N_AÑOS_MIN
+            )
+            for _, r in pv_pares_cat[mask_c1].iterrows():
+                c = _curva_norm(r)
+                if c:
+                    curvas.append(c)
+        if len(curvas) >= N_MIN:
+            return curvas, "IES_referentes_cat_directa"
+
+        progs_cat = [p for p in cat_a_progs_eafit.get(cat, []) if p != prog_norm]
+        mask_c2 = pv_eafit["PROGRAMA"].isin(progs_cat) & (
+            pv_eafit["n_años"] >= N_AÑOS_MIN
+        )
+        for _, r in pv_eafit[mask_c2].iterrows():
+            c = _curva_norm(r)
+            if c:
+                curvas.append(c)
+        if len(curvas) >= N_MIN:
+            return curvas, "EAFIT_cat_directa"
+
+        palabras = [w for w in _re.sub(r"[^A-Z0-9\s]", " ", cat).split() if len(w) > 3]
+        mask_c3e = (
+            pv_eafit["PROGRAMA"].apply(lambda p: any(w in p for w in palabras))
+            & (pv_eafit["n_años"] >= N_AÑOS_MIN)
+            & ~pv_eafit["PROGRAMA"].isin(progs_cat + [prog_norm])
+        )
+        for _, r in pv_eafit[mask_c3e].iterrows():
+            c = _curva_norm(r)
+            if c:
+                curvas.append(c)
+
+        if pv_pares_cat is not None:
+            mask_c3p = (
+                pv_pares_cat["_CAMPO_EAFIT"].apply(
+                    lambda x: any(w in _n(str(x)) for w in palabras)
+                    if pd.notna(x)
+                    else False
+                )
+                & (pv_pares_cat["n_años"] >= N_AÑOS_MIN)
+                & (pv_pares_cat["_CATEGORIA"] != cat)
+            )
+            for _, r in pv_pares_cat[mask_c3p].iterrows():
+                c = _curva_norm(r)
+                if c:
+                    curvas.append(c)
+
+        if len(curvas) >= N_MIN:
+            return curvas, "campo_amplio"
+
+        return [], "CAGR_fallback"
+
+    def _proy_analogos(
+        curvas: list[list[float]],
+        fuente: str,
+        valor_base: float,
+        serie_cat: dict[int, float],
+    ) -> tuple[dict[int, dict[str, float | None]], bool]:
+        resultado: dict[int, dict[str, float | None]] = {}
+        fallback = fuente == "CAGR_fallback" or len(curvas) < N_MIN
+
+        if not fallback and valor_base > 0:
+            matriz = np.array(curvas[:50])
+            for i, año_p in enumerate(AÑOS_PROY):
+                col = matriz[:, i] if i < matriz.shape[1] else np.array([1.0])
+                resultado[año_p] = {
+                    "P25": max(
+                        0.0, round(float(np.percentile(col, 25)) * valor_base, 1)
+                    ),
+                    "MEDIAN": max(
+                        0.0, round(float(np.median(col)) * valor_base, 1)
+                    ),
+                    "P75": max(
+                        0.0, round(float(np.percentile(col, 75)) * valor_base, 1)
+                    ),
+                }
+        else:
+            fallback = True
+            vals = [
+                (yr, serie_cat[yr])
+                for yr in AÑOS_DATOS[-4:]
+                if serie_cat.get(yr, 0) > 0
+            ]
+            if len(vals) >= 2 and valor_base > 0:
+                v0, v1 = vals[0][1], vals[-1][1]
+                n = vals[-1][0] - vals[0][0]
+                cagr = (v1 / v0) ** (1 / n) - 1 if v0 > 0 and n > 0 else 0.0
+                for i, año_p in enumerate(AÑOS_PROY):
+                    central = valor_base * ((1 + cagr) ** (i + 1))
+                    resultado[año_p] = {
+                        "P25": max(0.0, round(central * 0.80, 1)),
+                        "MEDIAN": max(0.0, round(central, 1)),
+                        "P75": max(0.0, round(central * 1.20, 1)),
+                    }
+            else:
+                for año_p in AÑOS_PROY:
+                    resultado[año_p] = {"P25": None, "MEDIAN": None, "P75": None}
+
+        return resultado, fallback
+
+    progs_unicos = (
+        df_v[
+            [
+                "PROGRAMA_EAFIT",
+                "_PROG_NORM",
+                "_CAT",
+                "NIVEL",
+                "PROG_ID",
+            ]
+        ]
+        .drop_duplicates(subset=["_PROG_NORM"])
+        .reset_index(drop=True)
+    )
+
+    filas_resultado: list[dict] = []
+    for _, prow in progs_unicos.iterrows():
+        prog_eafit = prow["PROGRAMA_EAFIT"]
+        prog_norm = prow["_PROG_NORM"]
+        cat = prow["_CAT"]
+        nivel = prow.get("NIVEL", "")
+        prog_id = prow.get("PROG_ID", "")
+
+        serie_cat = serie_por_cat.get(cat, {yr: 0.0 for yr in AÑOS_DATOS})
+        partic = _participacion_eafit(cat, prog_norm)
+        proy_cat_27 = _reg_lineal(serie_cat, 2027)
+        valor_base = proy_cat_27 * partic if proy_cat_27 and proy_cat_27 > 0 else 0.0
+
+        fila: dict = {
+            "ID Programa": prog_id,
+            "Programa EAFIT": prog_eafit,
+            "Nivel": nivel,
+            "Categoría": cat,
+            "Participación hist. EAFIT": round(partic, 4),
+        }
+
+        for año_p in AÑOS_PROY:
+            proy_c = _reg_lineal(serie_cat, año_p)
+            fila[f"P1_{año_p}"] = (
+                round(proy_c * partic, 1) if proy_c else None
+            )
+
+        curvas, fuente = _get_curvas(cat, prog_norm)
+        proy2, fb = _proy_analogos(curvas, fuente, valor_base, serie_cat)
+
+        for año_p in AÑOS_PROY:
+            v = proy2.get(año_p, {})
+            fila[f"P2_P25_{año_p}"] = v.get("P25")
+            fila[f"P2_MED_{año_p}"] = v.get("MEDIAN")
+            fila[f"P2_P75_{año_p}"] = v.get("P75")
+
+        fila["N° análogos"] = len(curvas)
+        fila["Fuente análogos"] = fuente
+        fila["¿Fallback?"] = "Sí" if fb else "No"
+
+        filas_resultado.append(fila)
+
+    df_result = pd.DataFrame(filas_resultado)
+    log(
+        f"  [Proyecciones] {len(df_result)} programas procesados "
+        f"| con análogos: {(df_result['¿Fallback?'] == 'No').sum()} "
+        f"| fallback: {(df_result['¿Fallback?'] == 'Sí').sum()}"
+    )
+    return df_result
 
 
 def run_fase_valorizacion(log: Callable = print) -> Path:
@@ -1495,6 +2045,7 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                     "M_costo_promedio": met_m_s["costo_promedio"],
                     "M_score_costo": met_m_s["score_costo"],
                     "M_calificacion": met_m_s["calificacion_final"],
+                    "M_señal_tendencia": met_m_s.get("SEÑAL_TENDENCIA", np.nan),
                     # ── SECCIÓN REFERENTES ───────────────────────────────────
                     "R_prom_matricula": met_r_s[f"prom_matricula_{AÑO_FIN_DATOS}"],
                     "R_score_matricula": met_r_s["score_matricula"],
@@ -1515,6 +2066,7 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                     "R_costo_promedio": met_r_s["costo_promedio"],
                     "R_score_costo": met_r_s["score_costo"],
                     "R_calificacion": met_r_s["calificacion_final"],
+                    "R_señal_tendencia": met_r_s.get("SEÑAL_TENDENCIA", np.nan),
                     # ── CALIFICACIÓN INTEGRADA ────────────────────────────────
                     # 40% calificación mercado regional + 60% calificación referentes nacionales
                     "CAL_INTEGRADA": cal_integrada,
@@ -1525,38 +2077,22 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
                         "BAJA" if cal_integrada >= 2.5 else
                         "MUY_BAJA"
                     ) if pd.notna(cal_integrada) else np.nan,
+                    "VIABILIDAD_BINARIA": (
+                        "Viable"
+                        if pd.notna(cal_integrada) and cal_integrada >= 3.0
+                        else "No viable"
+                        if pd.notna(cal_integrada)
+                        else np.nan
+                    ),
                     "PROYECCION_REGRESION": (
                         _proyeccion_regresion_lineal(
                             serie_pc=met_r_s.get("serie_primer_curso", {}),
-                            año_objetivo=int(
-                                _ANO_LANZAMIENTO_URGENTE
-                                if (
-                                    pd.notna(cal_integrada)
-                                    and cal_integrada >= 3.5
-                                    and float(met_r_s.get("AAGR_ROBUSTO", 0) or 0) >= 0.05
-                                )
-                                else _ANO_LANZAMIENTO_NORMAL
-                                if (pd.notna(cal_integrada) and cal_integrada >= 3.0)
-                                else AÑO_FIN_DATOS + 2
-                            ),
+                            año_objetivo=_AÑO_PROYECCION_REGRESION,
                             tasa_captura=TASA_CAPTURA_EAFIT,
                         )
                         if pd.notna(cal_integrada)
                         else np.nan
                     ),
-                    "PROYECCION_PENDIENTE": np.nan,
-                    "ANO_LANZAMIENTO": (
-                        _ANO_LANZAMIENTO_URGENTE
-                        if (
-                            pd.notna(cal_integrada)
-                            and cal_integrada >= 3.5
-                            and float(met_r_s.get("AAGR_ROBUSTO", 0) or 0) >= 0.05
-                        )
-                        else _ANO_LANZAMIENTO_NORMAL
-                        if (pd.notna(cal_integrada) and cal_integrada >= 3.0)
-                        else np.nan
-                    ),
-                    "SEMESTRE_LANZAMIENTO": np.nan,
                 }
             )
 
@@ -1580,28 +2116,79 @@ def run_fase_valorizacion(log: Callable = print) -> Path:
         writer.sheets["Crecimiento_Mercado"] = ws_crec
         _formatear_hoja_crecimiento(writer, df_crec)
 
+        # ── Hoja 3: Proyecciones 2027-2031 ───────────────────────────
+        log("  Construyendo hoja Proyecciones...")
+        try:
+            df_proy = _construir_hoja_proyecciones(
+                df_programas_val=df_out,
+                sabana=sabana,
+                log=log,
+            )
+            if not df_proy.empty:
+                ws_proy = writer.book.create_sheet("Proyecciones")
+                writer.sheets["Proyecciones"] = ws_proy
+                try:
+                    _formatear_hoja_proyecciones(writer, df_proy)
+                except Exception as _fmt_e:
+                    log_warning(
+                        f"  Formato Proyecciones falló ({_fmt_e}); "
+                        "escribiendo tabla sin formato."
+                    )
+                    from openpyxl.utils.dataframe import dataframe_to_rows
+
+                    for r_i, row in enumerate(
+                        dataframe_to_rows(df_proy, index=False, header=True), 1
+                    ):
+                        for c_i, val in enumerate(row, 1):
+                            ws_proy.cell(row=r_i, column=c_i, value=val)
+                log(f"  ✓ Hoja Proyecciones: {len(df_proy)} programas")
+            else:
+                log_warning("  ⚠ Hoja Proyecciones vacía — se omite.")
+        except Exception as _e:
+            log_warning(f"  ⚠ Error construyendo Proyecciones: {_e}")
+            import traceback as _tb
+
+            log_warning(_tb.format_exc())
+
     log(f"✓ Generado: {ruta}")
     return ruta
 
 
 def _reordenar_columnas_valorizacion(df_out: pd.DataFrame) -> pd.DataFrame:
-    """IDENTIFICACIÓN → CONCLUSIÓN → MERCADO → REFERENTES; SEMESTRE sin NaN."""
+    """IDENTIFICACIÓN → CONCLUSIÓN → MERCADO → REFERENTES (orden intercalado valor|score)."""
     _cols_id = [
         "PROG_ID", "CAT_ID", "CATEGORIA", "NIVEL",
         "PROGRAMA_EAFIT", "TIENE_ESTUDIO_MERCADO", "REGION",
     ]
     _cols_concl = [
-        "VIABILIDAD_ESTUDIO", "CAL_INTEGRADA",
-        "ANO_LANZAMIENTO", "SEMESTRE_LANZAMIENTO",
-        "PROYECCION_REGRESION", "PROYECCION_PENDIENTE",
+        "VIABILIDAD_ESTUDIO", "VIABILIDAD_BINARIA", "CAL_INTEGRADA", "PROYECCION_REGRESION",
     ]
-    _cols_m = [c for c in df_out.columns if c.startswith("M_")]
-    _cols_r = [c for c in df_out.columns if c.startswith("R_")]
+    _cols_m = [
+        "M_prom_matricula", "M_score_matricula",
+        "M_participacion", "M_score_participacion",
+        "M_AAGR", "M_score_AAGR",
+        "M_salario_smlmv", "M_score_salario",
+        "M_pct_no_matriculados", "M_score_no_mat",
+        "M_num_programas", "M_score_num_programas",
+        "M_pct_con_matricula",
+        "M_programas_activos", "M_programas_nuevos_3a", "M_programas_inactivos",
+        "M_costo_promedio", "M_score_costo",
+        "M_calificacion", "M_señal_tendencia",
+    ]
+    _cols_r = [
+        "R_prom_matricula", "R_score_matricula",
+        "R_participacion", "R_score_participacion",
+        "R_AAGR", "R_score_AAGR",
+        "R_salario_smlmv", "R_score_salario",
+        "R_pct_no_matriculados", "R_score_no_mat",
+        "R_num_programas", "R_score_num_programas",
+        "R_pct_con_matricula",
+        "R_programas_activos", "R_programas_nuevos_3a", "R_programas_inactivos",
+        "R_costo_promedio", "R_score_costo",
+        "R_calificacion", "R_señal_tendencia",
+    ]
     _orden = _cols_id + _cols_concl + _cols_m + _cols_r
-    df = df_out[[c for c in _orden if c in df_out.columns]].copy()
-    if "SEMESTRE_LANZAMIENTO" in df.columns:
-        df["SEMESTRE_LANZAMIENTO"] = df["SEMESTRE_LANZAMIENTO"].fillna("")
-    return df
+    return df_out[[c for c in _orden if c in df_out.columns]].copy()
 
 
 def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
@@ -1653,8 +2240,8 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
     ws.insert_rows(1, 2)
 
     N_ID = 7  # PROG_ID, CAT_ID, Categoría, Nivel, Programa, ¿Tiene estudio?, Región
-    N_CONCL = 6  # VIABILIDAD, CAL_INTEGRADA, AÑO, SEMESTRE, 2 proyecciones
-    N_MET = len(_cols_m)  # columnas M_ (dinámico, actualmente 19)
+    N_CONCL = 4  # VIABILIDAD_ESTUDIO, VIABILIDAD_BINARIA, CAL_INTEGRADA, PROYECCION_REGRESION
+    N_MET = len(_cols_m)  # columnas M_ (dinámico, actualmente 20)
 
     DORADO_CONCL = "7B5E00"  # dorado oscuro para sección conclusión
 
@@ -1702,6 +2289,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "M_costo_promedio": "Costo Promedio",
         "M_score_costo": "Score",
         "M_calificacion": "CALIFICACIÓN",
+        "M_señal_tendencia": "Señal Tendencia",
         "R_prom_matricula": f"Prom. Primer Curso {AÑO_FIN_DATOS}",
         "R_score_matricula": "Score",
         "R_participacion": f"Participación {AÑO_FIN_DATOS}",
@@ -1721,12 +2309,11 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "R_costo_promedio": "Costo Promedio",
         "R_score_costo": "Score",
         "R_calificacion": "CALIFICACIÓN",
+        "R_señal_tendencia": "Señal Tendencia",
         "CAL_INTEGRADA": "CAL. INTEGRADA (40%M + 60%R)",
-        "VIABILIDAD_ESTUDIO": "Viabilidad Estudio",
-        "PROYECCION_REGRESION": "Proyección Regresión Lineal (est.)",
-        "PROYECCION_PENDIENTE": "Proyección 2 (pendiente)",
-        "ANO_LANZAMIENTO": "Año Lanzamiento",
-        "SEMESTRE_LANZAMIENTO": "Semestre",
+        "VIABILIDAD_ESTUDIO": "Viabilidad (4 niveles)",
+        "VIABILIDAD_BINARIA": "Viabilidad",
+        "PROYECCION_REGRESION": f"Proyección Primer Curso {AÑO_FIN_DATOS + 2} (est.)",
     }
     for ci, col in enumerate(cols, 1):
         cell = ws.cell(row=2, column=ci)
@@ -1744,7 +2331,19 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         cell.border = borde
         if col == "VIABILIDAD_ESTUDIO":
             cell.comment = Comment(
-                "Calculado automáticamente desde CAL_INTEGRADA. Ajustar si hay factores adicionales.",
+                "ALTA ≥ 3.5 · MEDIA ≥ 3.0 · BAJA ≥ 2.5 · MUY_BAJA < 2.5. "
+                "Basado en CAL_INTEGRADA = 40%×Mercado + 60%×Referentes.",
+                "SNIESManager",
+            )
+        elif col == "VIABILIDAD_BINARIA":
+            cell.comment = Comment(
+                "Replica el formato del manual de referencia. Viable si CAL_INTEGRADA ≥ 3.0.",
+                "SNIESManager",
+            )
+        elif col == "PROYECCION_REGRESION":
+            cell.comment = Comment(
+                f"Estimación de primer_curso en {AÑO_FIN_DATOS + 2} usando regresión lineal "
+                f"sobre IES referentes × tasa de captura EAFIT ({TASA_CAPTURA_EAFIT:.0%}).",
                 "SNIESManager",
             )
     ws.row_dimensions[2].height = 32
@@ -1764,7 +2363,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         ci
         for ci, c in enumerate(cols, 1)
         if any(k in c for k in ("num_programas", "activos", "nuevos", "inactivos"))
-        or c in ("PROYECCION_REGRESION", "ANO_LANZAMIENTO")
+        or c == "PROYECCION_REGRESION"
     }
     cost_cols = {ci for ci, c in enumerate(cols, 1) if "costo_promedio" in c}
     prom_cols = {ci for ci, c in enumerate(cols, 1) if "prom_matricula" in c}
@@ -1802,6 +2401,29 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
                 cell.font = Font(bold=True, color=fg, name="Arial", size=10)
                 continue
 
+            elif col == "VIABILIDAD_BINARIA":
+                val_b = str(cell.value).strip() if cell.value else ""
+                bg_b = "C6EFCE" if val_b == "Viable" else ("FFC7CE" if val_b == "No viable" else "F2F2F2")
+                fg_b = "1A6B2B" if val_b == "Viable" else ("9C0006" if val_b == "No viable" else "1A1A1A")
+                cell.fill = PatternFill("solid", fgColor=bg_b)
+                cell.font = Font(bold=True, color=fg_b, name="Arial", size=10)
+                continue
+
+            elif "señal_tendencia" in col:
+                tendencia_colores = {
+                    "ACELERANDO": "C6EFCE",
+                    "ESTABLE": "EBF9EE",
+                    "DESACELERANDO": "FFFDE7",
+                    "EN_DECLIVE": "FFD9B3",
+                    "CONTRACCION": "FFC7CE",
+                    "SIN_ACTIVIDAD": "F2F2F2",
+                    "SIN_DATO": "EEEEEE",
+                }
+                val_t = str(cell.value).strip().upper() if cell.value else ""
+                cell.fill = PatternFill("solid", fgColor=tendencia_colores.get(val_t, "F2F2F2"))
+                cell.font = Font(name="Arial", size=9)
+                continue
+
             elif col == "CAL_INTEGRADA":
                 try:
                     v = float(cell.value) if cell.value is not None else None
@@ -1828,7 +2450,7 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
                 cell.alignment = Alignment(horizontal="left", vertical="center")
 
             elif ci <= N_ID + N_CONCL:
-                if col not in ("VIABILIDAD_ESTUDIO", "CAL_INTEGRADA"):
+                if col not in ("VIABILIDAD_ESTUDIO", "VIABILIDAD_BINARIA", "CAL_INTEGRADA"):
                     cell.fill = fill("FFFDF0" if alt else "FFFFF8")
                     cell.font = Font(bold=False, name="Arial", size=9)
 
@@ -1857,10 +2479,10 @@ def _formatear_hoja_valorizacion(writer, df_out: pd.DataFrame) -> None:
         "REGION": 13,
         "CAL_INTEGRADA": 16,
         "VIABILIDAD_ESTUDIO": 16,
-        "PROYECCION_REGRESION": 26,
-        "PROYECCION_PENDIENTE": 22,
-        "ANO_LANZAMIENTO": 14,
-        "SEMESTRE_LANZAMIENTO": 11,
+        "VIABILIDAD_BINARIA": 13,
+        "PROYECCION_REGRESION": 28,
+        "M_señal_tendencia": 16,
+        "R_señal_tendencia": 16,
     }
     for ci, col in enumerate(cols, 1):
         ws.column_dimensions[get_column_letter(ci)].width = ANCHOS.get(col, 9 if "score" in col.lower() else 14)
@@ -1874,7 +2496,7 @@ def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
     Formatea la hoja Crecimiento_Mercado con bloques de cabecera + datos.
     Cada combo: 4 filas de cabecera + 1 blank + 3 datos + 1 blank.
     """
-    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
     ws = writer.sheets["Crecimiento_Mercado"]
@@ -1899,6 +2521,7 @@ def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
         "CAGR 2021-2024",
     ]
     last_col = len(all_cols) + 1
+    CONTEXT_COL = last_col + 2
 
     if ws.max_row:
         ws.delete_rows(1, ws.max_row)
@@ -1921,6 +2544,11 @@ def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
         if "CAGR" in str(col):
             cell.number_format = FMT_PCT
 
+    ctx_hdr = ws.cell(row=1, column=CONTEXT_COL, value="Descripción del segmento")
+    ctx_hdr.font = hdr_font
+    ctx_hdr.fill = hdr_fill
+    ctx_hdr.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
     ws.row_dimensions[1].height = 22
     ws.freeze_panes = "B2"
 
@@ -1928,9 +2556,23 @@ def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
     section_font_bold = Font(bold=True, color=COLOR_HEADER_FG, name="Arial", size=9)
     section_font_val = Font(color=COLOR_HEADER_FG, name="Arial", size=9)
 
+    ctx_border = Border(
+        left=Side(style="medium", color="1C3557"),
+        top=Side(style="thin", color="BDC3C7"),
+        bottom=Side(style="thin", color="BDC3C7"),
+        right=Side(style="thin", color="BDC3C7"),
+    )
+
     current_row = 2
+    context_start_row: int | None = None
+    context_text: str | None = None
+
     for _, fila in df.iterrows():
         tipo = fila.get("__tipo", "data")
+
+        if tipo == "header" and fila.get("__campo") == "SEGMENTO":
+            context_start_row = current_row
+            context_text = str(fila.get("__contexto", "") or "")
 
         if tipo == "blank":
             current_row += 1
@@ -1989,11 +2631,283 @@ def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
                     cell.number_format = FMT_NUM
 
             ws.row_dimensions[current_row].height = 16
+
+            if str(nivel).strip() == "Total" and context_start_row is not None:
+                context_end_row = current_row
+                ctx_cell = ws.cell(
+                    row=context_start_row,
+                    column=CONTEXT_COL,
+                    value=context_text,
+                )
+                ctx_cell.font = Font(
+                    name="Arial", size=9, color="2C3E50", italic=False
+                )
+                ctx_cell.fill = PatternFill("solid", fgColor="EBF3FB")
+                ctx_cell.alignment = Alignment(
+                    horizontal="left",
+                    vertical="top",
+                    wrap_text=True,
+                )
+                ctx_cell.border = ctx_border
+                ws.merge_cells(
+                    start_row=context_start_row,
+                    start_column=CONTEXT_COL,
+                    end_row=context_end_row,
+                    end_column=CONTEXT_COL,
+                )
+                context_start_row = None
+                context_text = None
+
             current_row += 1
 
     ws.column_dimensions["A"].width = 42
     for j in range(2, last_col + 1):
         letter = get_column_letter(j)
         ws.column_dimensions[letter].width = 10 if j <= len(años_cols) + 1 else 12
+    ws.column_dimensions[get_column_letter(CONTEXT_COL)].width = 52
 
     ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}1"
+
+
+def _formatear_hoja_proyecciones(
+    writer: pd.ExcelWriter,
+    df: pd.DataFrame,
+) -> None:
+    """
+    Escribe y formatea la hoja Proyecciones desde cero (3 filas de encabezado).
+    Fila 1: bloques de sección | Fila 2: años (P2) | Fila 3: columnas | Datos: 4+
+    """
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    ws = writer.sheets["Proyecciones"]
+    if ws.max_row:
+        ws.delete_rows(1, ws.max_row)
+
+    cols = list(df.columns)
+    p1_cols = [c for c in cols if str(c).startswith("P1_")]
+    p2_cols = [c for c in cols if str(c).startswith("P2_")]
+    meta_cols = [c for c in cols if c in ("N° análogos", "Fuente análogos", "¿Fallback?")]
+    id_cols = [c for c in cols if c not in p1_cols + p2_cols + meta_cols]
+
+    n_id = len(id_cols)
+    n_p1 = len(p1_cols)
+    n_p2 = len(p2_cols)
+    n_meta = len(meta_cols)
+    n_cols = len(cols)
+
+    AZUL = "000066"
+    VERDE = "1F7A3C"
+    NARANJA = "BF360C"
+    GRIS = "37474F"
+    BLANCO = "FFFFFF"
+    AZUL_CLARO = "E8EEF7"
+    VERDE_CLARO = "E8F5E9"
+    NARANJA_CLARO = "FFF3E0"
+    GRIS_CLARO = "ECEFF1"
+
+    borde = Border(
+        left=Side(style="thin", color="CCCCCC"),
+        right=Side(style="thin", color="CCCCCC"),
+        top=Side(style="thin", color="CCCCCC"),
+        bottom=Side(style="thin", color="CCCCCC"),
+    )
+
+    def _fill(c: str) -> PatternFill:
+        return PatternFill("solid", fgColor=c)
+
+    def _font(
+        c: str = BLANCO, bold: bool = True, sz: int = 9
+    ) -> Font:
+        return Font(bold=bold, color=c, name="Calibri", size=sz)
+
+    def _set_block(r: int, c1: int, c2: int, titulo: str, color: str, *, sz: int = 10) -> None:
+        c2 = min(c2, n_cols)
+        if c1 > c2 or c1 > n_cols or n_cols == 0:
+            return
+        ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c2)
+        cell = ws.cell(row=r, column=c1, value=titulo)
+        cell.fill = _fill(color)
+        cell.font = _font(BLANCO, bold=True, sz=sz)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = borde
+
+    # ── Fila 1: secciones principales ─────────────────────────────────────
+    _set_block(1, 1, n_id, "IDENTIFICACIÓN DEL PROGRAMA", AZUL)
+    _set_block(
+        1,
+        n_id + 1,
+        n_id + n_p1,
+        "PROYECCIÓN 1\nRegresión lineal del mercado × participación EAFIT\n(estudiantes / año)",
+        VERDE,
+    )
+    _set_block(
+        1,
+        n_id + n_p1 + 1,
+        n_id + n_p1 + n_p2,
+        "PROYECCIÓN 2 — Escenarios por análogos históricos\nP25 (pesimista) · Mediana · P75 (optimista)",
+        NARANJA,
+    )
+    _set_block(1, n_id + n_p1 + n_p2 + 1, n_cols, "METADATOS DEL MÉTODO", GRIS)
+    ws.row_dimensions[1].height = 36
+
+    # ── Fila 2: sub-encabezados por año (solo bloque P2) ──────────────────
+    p2_start = n_id + n_p1 + 1
+    años_p2: list[int] = []
+    for c in p2_cols:
+        yr_s = str(c).split("_")[-1]
+        if yr_s.isdigit():
+            años_p2.append(int(yr_s))
+    años_p2 = sorted(set(años_p2))
+
+    for ci in range(1, n_cols + 1):
+        cell = ws.cell(row=2, column=ci)
+        cell.border = borde
+        if ci < p2_start or ci >= p2_start + n_p2:
+            cell.fill = _fill(
+                AZUL if ci <= n_id else VERDE if ci <= n_id + n_p1 else GRIS
+            )
+        else:
+            cell.fill = _fill(NARANJA)
+
+    ci = p2_start
+    for yr in años_p2:
+        trio = [c for c in p2_cols if str(c).endswith(f"_{yr}")]
+        if len(trio) != 3:
+            continue
+        c_fin = ci + len(trio) - 1
+        ws.merge_cells(start_row=2, start_column=ci, end_row=2, end_column=c_fin)
+        cell = ws.cell(row=2, column=ci, value=str(yr))
+        cell.font = _font(BLANCO, bold=True, sz=10)
+        cell.fill = _fill(NARANJA)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = borde
+        ci = c_fin + 1
+    ws.row_dimensions[2].height = 18
+
+    # ── Fila 3: nombres de columna ────────────────────────────────────────
+    _HDR_ID = {
+        "ID Programa": "ID",
+        "Programa EAFIT": "Programa EAFIT",
+        "Nivel": "Nivel",
+        "Categoría": "Categoría mercado",
+        "Participación hist. EAFIT": "Partic. EAFIT",
+    }
+
+    def _hdr_label(col: str) -> str:
+        if col in _HDR_ID:
+            return _HDR_ID[col]
+        if col.startswith("P1_"):
+            return str(col[3:])
+        if col.startswith("P2_P25_"):
+            return "P25"
+        if col.startswith("P2_MED_"):
+            return "Mediana"
+        if col.startswith("P2_P75_"):
+            return "P75"
+        if col == "N° análogos":
+            return "N análogos"
+        if col == "Fuente análogos":
+            return "Fuente"
+        if col == "¿Fallback?":
+            return "Fallback"
+        return col
+
+    def _bloque_col(ci: int) -> str:
+        if ci <= n_id:
+            return "id"
+        if ci <= n_id + n_p1:
+            return "p1"
+        if ci <= n_id + n_p1 + n_p2:
+            return "p2"
+        return "meta"
+
+    _HDR_FILL = {"id": AZUL, "p1": VERDE, "p2": NARANJA, "meta": GRIS}
+
+    for ci, col in enumerate(cols, 1):
+        cell = ws.cell(row=3, column=ci, value=_hdr_label(col))
+        cell.font = _font(BLANCO, bold=True, sz=9)
+        cell.fill = _fill(_HDR_FILL[_bloque_col(ci)])
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+        cell.border = borde
+    ws.row_dimensions[3].height = 32
+
+    # ── Datos (fila 4+) ───────────────────────────────────────────────────
+    FMT_NUM = "#,##0"
+    FMT_PCT = "0.0%"
+
+    def _valor_celda(col: str, val) -> object:
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return None
+        if "Participación" in col:
+            return float(val)
+        if col.startswith("P1_") or col.startswith("P2_"):
+            num = pd.to_numeric(val, errors="coerce")
+            return None if pd.isna(num) else float(num)
+        return val
+
+    _DATA_FILL = {
+        "id": AZUL_CLARO,
+        "p1": VERDE_CLARO,
+        "p2": NARANJA_CLARO,
+        "meta": GRIS_CLARO,
+    }
+
+    for ri, (_, row) in enumerate(df.iterrows(), start=4):
+        zebra = ri % 2 == 0
+        for ci, col in enumerate(cols, 1):
+            blk = _bloque_col(ci)
+            cell = ws.cell(row=ri, column=ci, value=_valor_celda(col, row.get(col)))
+            base_fill = _DATA_FILL[blk]
+            if zebra and blk == "id":
+                cell.fill = _fill("F5F8FC")
+            elif zebra:
+                cell.fill = _fill("FAFAFA")
+            else:
+                cell.fill = _fill(base_fill)
+            cell.border = borde
+            cell.font = Font(name="Calibri", size=10)
+
+            if col.startswith("P1_") or col.startswith("P2_"):
+                cell.number_format = FMT_NUM
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif "Participación" in col:
+                cell.number_format = FMT_PCT
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif col == "Programa EAFIT":
+                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+            elif col in ("Categoría", "Fuente análogos"):
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            elif col == "¿Fallback?":
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                if cell.value == "Sí":
+                    cell.fill = _fill("FFEBEE")
+                    cell.font = Font(name="Calibri", size=10, color="C62828")
+            else:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.row_dimensions[ri].height = 16
+
+    # ── Anchos y vista ────────────────────────────────────────────────────
+    _anchos = {
+        "ID Programa": 11,
+        "Programa EAFIT": 42,
+        "Nivel": 14,
+        "Categoría": 28,
+        "Participación hist. EAFIT": 12,
+        "N° análogos": 10,
+        "Fuente análogos": 22,
+        "¿Fallback?": 10,
+    }
+    for ci, col in enumerate(cols, 1):
+        letter = get_column_letter(ci)
+        if col.startswith("P1_") or col.startswith("P2_"):
+            ws.column_dimensions[letter].width = 9
+        else:
+            ws.column_dimensions[letter].width = _anchos.get(col, 12)
+
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "E4"
+    ws.auto_filter.ref = f"A3:{get_column_letter(n_cols)}{3 + len(df)}"
